@@ -1,0 +1,9 @@
+Package: com.miron302.standby16
+Name: StandBy16
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: iOS 17 StandBy for iOS 16. Charge it, lock it, turn it sideways.
+Maintainer: miron302
+Author: miron302
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 16.0)
