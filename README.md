@@ -21,7 +21,7 @@ It reopens on the last view/style you used. Night mode turns everything red-mono
 Activation = locked + charging + landscape + held still for ~0.8s. With motionToWake on, a night-mode screen
 that has slept wakes when it senses movement.
 
-## Build (on your hackintosh, with Theos installed)
+## Build (on macOS, with Theos installed)
     export THEOS=~/theos
     make package
     make package install THEOS_DEVICE_IP=<iphone ip>     # or copy the .deb over and install it with Sileo/dpkg
