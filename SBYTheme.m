@@ -42,6 +42,7 @@
             @"overlayMethod": @0,
             @"orientationFlip": @0,
             @"hideSystemUI": @YES,
+            @"showWhileScreenOff": @YES,
             @"leftOrder": @"0,1,2",
             @"rightOrder": @"3,4,5",
         }];

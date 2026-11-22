@@ -55,7 +55,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>Version 1.0.1. Lock the phone, plug it in and turn it sideways. Changes apply next time StandBy appears. Advanced detection options are in the separate "StandBy16 Trigger Methods" entry in Settings.</string>
+			<string>Version 1.0.2. Lock the phone, plug it in and turn it sideways. Changes apply next time StandBy appears. Advanced detection options are in the separate "StandBy16 Trigger Methods" entry in Settings.</string>
 			<key>label</key>
 			<string>StandBy16</string>
 		</dict>
@@ -94,6 +94,18 @@
 			<string>keepAwake</string>
 			<key>label</key>
 			<string>Keep screen on (always-on)</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.miron302.standby16</string>
+			<key>key</key>
+			<string>showWhileScreenOff</string>
+			<key>label</key>
+			<string>Stay ready while screen is off</string>
 		</dict>
 		<dict>
 			<key>cell</key>

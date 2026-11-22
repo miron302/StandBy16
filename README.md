@@ -31,7 +31,7 @@ If it says `iphoneos-arm`, the build was rootful and Sileo will refuse it on a r
 ## Already have a rootful .deb? Convert it on the phone (NewTerm, no computer)
 A build service that ignores the rootless setting produces `iphoneos-arm`, which Sileo refuses on a rootless jailbreak.
 StandBy16 has no rootful/rootless code differences, so the package can simply be repacked:
-    D=/path/to/com.miron302.standby16_1.0.1_iphoneos-arm.deb
+    D=/path/to/com.miron302.standby16_1.0.2_iphoneos-arm.deb
     rm -rf ~/sby && mkdir -p ~/sby
     dpkg-deb -R "$D" ~/sby
     mkdir -p ~/sby/var/jb
@@ -98,7 +98,7 @@ is portrait only). Pixel shift every minute for OLED burn-in. Night mode = red p
    all runtime-looked-up private APIs; if one is missing on 16.7.x that single feature just stays quiet.
 6. Motion-to-wake calls -[SBBacklightController turnOnScreenFullyWithBacklightSource:] (selector may differ).
 
-Version: 1.0.1
+Version: 1.0.2
 
 ## Previewing without the trigger sequence
 - Settings > StandBy16 > Preview > **Preview StandBy now** (flip the switch): shows StandBy for 25s in a separate window,
@@ -125,6 +125,13 @@ If a method breaks the trigger, use **Reset all to defaults** at the bottom of t
 - If it is rotated the wrong way, Settings > StandBy16 Trigger Methods > Orientation direction > Flipped 180°.
 - Pages follow your finger when you swipe (rubber-band) and spring back; page changes spring; the time dissolves when
   the minute changes; Now Playing has an artwork-colour glow, the artwork shrinks while paused, and the buttons press.
+
+## Screen off / wake
+StandBy now stays loaded while the screen is off, so waking the phone shows StandBy immediately instead of flashing the
+iOS lock screen first (Settings > StandBy16 > Stay ready while screen is off). While the screen is off it only refreshes
+every ~5s, and everything is refreshed the instant the screen wakes.
+"Keep screen on" (always-on) is best-effort: the log lists the idle-timer methods this iOS has
+(`SBBacklightController idle-related methods: ...`) so the right one can be wired up.
 
 ## Stability notes
 - Every state check and the 4Hz redraw run inside @try/@catch, so a bad value can't take SpringBoard down.

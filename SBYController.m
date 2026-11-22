@@ -4,6 +4,7 @@
 #import "SBYTheme.h"
 #import <notify.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <objc/message.h>
 #import <CoreTelephony/CTCallCenter.h>
 #import <CoreTelephony/CTCall.h>
@@ -67,7 +68,8 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     NSTimer *_tickTimer, *_awakeTimer, *_shiftTimer, *_fadeTimer, *_pollTimer;
     CGSize _lastParentSize;
     NSMutableArray<NSDictionary *> *_hiddenViews;
-    BOOL _loggedWindows;
+    BOOL _loggedWindows, _wasBlanked;
+    NSUInteger _offTicks;
     UIDeviceOrientation _orient;
     BOOL _landscape, _suppressed, _started, _pendingShow;
     CGPoint _shift;
@@ -134,6 +136,8 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     static int pvTok, appTok;
     notify_register_dispatch("com.miron302.standby16/preview", &pvTok, dispatch_get_main_queue(), ^(int t) { [weakSelf showPreview]; });
     notify_register_dispatch("com.miron302.standby16/openapp", &appTok, dispatch_get_main_queue(), ^(int t) { [weakSelf openPreviewApp]; });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [weakSelf logIdleSelectors]; });
 
     // Belt and braces: re-check every 2s in case a notification is missed (cheap, only logs on change).
     _pollTimer = [NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(reevaluate) userInfo:nil repeats:YES];
@@ -220,7 +224,10 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 
 - (void)reevaluateNow:(BOOL)delay {
     if (_previewMode) return;
-    [self updateLandscape]; // picks up a changed orientation method within one poll // a manual preview owns the screen until it ends
+    [self updateLandscape]; // picks up a changed orientation method within one poll
+    BOOL nowBlanked = [self isScreenBlanked];
+    if (_wasBlanked && !nowBlanked) [self screenDidWake];
+    _wasBlanked = nowBlanked; // a manual preview owns the screen until it ends
     BOOL charging = ![SBYPrefs requireCharging] || [SBYServices isCharging];
     BOOL locked = [self isLocked];
     BOOL enabled = [SBYPrefs enabled];
@@ -229,7 +236,10 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 
     [self setMotionTracking:(enabled && locked && charging)];
 
-    BOOL ok = enabled && locked && ![self isScreenBlanked] && (force || (charging && _landscape)) && !_suppressed && ![self callActive];
+    // Stay installed while the screen is off, so waking it shows StandBy instantly instead of flashing the iOS lock screen first.
+    BOOL blanked = [self isScreenBlanked];
+    BOOL screenOK = !blanked || [SBYPrefs boolForKey:@"showWhileScreenOff"];
+    BOOL ok = enabled && locked && screenOK && (force || (charging && _landscape)) && !_suppressed && ![self callActive];
     NSString *state = [NSString stringWithFormat:@"force=%d enabled=%d locked=%d charging=%d landscape=%d blanked=%d call=%d suppressed=%d accel=%d host=%d methods(orient,lock,screen,still,overlay)=%ld%ld%ld%ld%ld -> %@",
                        force, enabled, locked, charging, _landscape, [self isScreenBlanked], [self callActive], _suppressed, _accelOrient, _hostVC != nil,
                        (long)[SBYPrefs integerForKey:@"orientationMethod"], (long)[SBYPrefs integerForKey:@"lockMethod"], (long)[SBYPrefs integerForKey:@"screenMethod"],
@@ -311,7 +321,8 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 
 - (void)show {
     // Estimate "dark room" from the system's auto-brightness level, before we touch brightness.
-    if (!_brightnessSaved)
+    // (Only sample while the screen is on: brightness reads ~0 when it is off.)
+    if (!_brightnessSaved && ![self isScreenBlanked])
         [SBYTheme setAmbientDark:[UIScreen mainScreen].brightness < [SBYPrefs ambientThreshold]];
 
     UIViewController *hv = _hostVC ?: [self lookupCoverSheetVC];
@@ -368,16 +379,20 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     [_content addSubview:_current];
 
     [self layoutContentAnimated:NO];
-    _content.alpha = 0;
-    _current.transform = CGAffineTransformMakeScale(0.93, 0.93);
+    BOOL screenOff = [self isScreenBlanked];
+    _wasBlanked = screenOff;
+    _content.alpha = screenOff ? 1 : 0;                       // no animation needed if nobody can see it
+    _current.transform = screenOff ? CGAffineTransformIdentity : CGAffineTransformMakeScale(0.93, 0.93);
     _win.hidden = NO;
     _loggedWindows = NO;
     [self hideSiblings];
     [self hideSystemChrome];
-    [UIView animateWithDuration:0.8 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0.2 options:0 animations:^{
-        self->_content.alpha = 1;
-        self->_current.transform = CGAffineTransformIdentity;
-    } completion:nil];
+    if (!screenOff) {
+        [UIView animateWithDuration:0.8 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0.2 options:0 animations:^{
+            self->_content.alpha = 1;
+            self->_current.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    }
 
     SBYTheme *t = [SBYTheme current];
     _current.theme = t;
@@ -462,6 +477,8 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 
 - (void)tickNow {
     if (!_current) return;
+    // While the screen is off only refresh every ~5s (keeps it ready without burning battery).
+    if ([self isScreenBlanked]) { if (++_offTicks % 20 != 0) return; } else _offTicks = 0;
     // The lock screen may reorder or resize its views; keep StandBy on top and sized to its parent.
     UIView *parent = _content.superview;
     if (parent) {
@@ -492,6 +509,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 // so the dark/light decision is refreshed each time StandBy appears.)
 - (void)applyBrightnessForTheme:(SBYTheme *)t {
     if (_previewMode) return; // never dim the screen for a preview
+    if ([self isScreenBlanked]) return; // applied by -screenDidWake instead
     CGFloat nb = [SBYPrefs nightBrightness];
     if (t.night && nb > 0) {
         if (!_brightnessSaved) {
@@ -523,12 +541,59 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 // Only when keepAwake=true: best-effort stop of auto-lock (selector names differ between iOS versions).
 - (void)keepAwake {
     SBYHoldAwake(YES, &_assertion);
-    Class bl = NSClassFromString(@"SBBacklightController");
-    id inst = [bl respondsToSelector:@selector(sharedInstance)] ? [bl performSelector:@selector(sharedInstance)] : nil;
-    SEL sels[] = { NSSelectorFromString(@"resetLockScreenIdleTimer"), NSSelectorFromString(@"resetIdleTimer") };
-    for (int i = 0; i < 2; i++) {
-        if ([inst respondsToSelector:sels[i]]) { [inst performSelector:sels[i]]; break; }
+    // Try every known way of resetting SpringBoard's idle (auto-lock) timer; which exist differs by iOS version.
+    NSArray *targets = @[ @[@"SBBacklightController", @"resetLockScreenIdleTimer"],
+                          @[@"SBBacklightController", @"resetIdleTimer"],
+                          @[@"SBBacklightController", @"_resetLockScreenIdleTimer"],
+                          @[@"SBIdleTimerGlobalCoordinator", @"resetIdleTimer"] ];
+    for (NSArray *t in targets) {
+        Class c = NSClassFromString(t[0]);
+        id inst = [c respondsToSelector:@selector(sharedInstance)] ? [c performSelector:@selector(sharedInstance)] : nil;
+        SEL sel = NSSelectorFromString(t[1]);
+        if ([inst respondsToSelector:sel]) [inst performSelector:sel];
     }
+    // Tell powerd the user is active (works on some builds where the above don't).
+    static int (*declareActivity)(CFStringRef, int, uint32_t *);
+    static uint32_t activityID;
+    if (!declareActivity) {
+        void *io = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+        if (io) declareActivity = dlsym(io, "IOPMAssertionDeclareUserActivity");
+    }
+    if (declareActivity) declareActivity(CFSTR("StandBy16"), 0, &activityID);
+}
+
+// Logged once at startup: lists the idle/auto-lock related methods this iOS version actually has,
+// so the keep-awake hook can be pointed at the right one if the guesses above don't work.
+- (void)logIdleSelectors {
+    for (NSString *cn in @[@"SBBacklightController", @"SBIdleTimerGlobalCoordinator", @"SBIdleTimerPolicyAggregator", @"SBLockScreenManager"]) {
+        Class c = NSClassFromString(cn);
+        if (!c) { SBYLog(@"class %@ is missing", cn); continue; }
+        unsigned n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        NSMutableArray *names = [NSMutableArray array];
+        for (unsigned i = 0; i < n; i++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[i]));
+            NSString *l = sn.lowercaseString;
+            if ([l containsString:@"idle"] || [l containsString:@"autolock"] || [l containsString:@"dimming"]) [names addObject:sn];
+        }
+        free(ms);
+        SBYLog(@"%@ idle-related methods: %@", cn, [names componentsJoinedByString:@", "]);
+    }
+}
+
+// The screen just turned back on: refresh everything immediately so StandBy is correct on the first frame.
+- (void)screenDidWake {
+    if (!_content) return;
+    if (!_brightnessSaved) [SBYTheme setAmbientDark:[UIScreen mainScreen].brightness < [SBYPrefs ambientThreshold]];
+    [_content.superview bringSubviewToFront:_content];
+    [self hideSiblings];
+    [self hideSystemChrome];
+    SBYTheme *t = [SBYTheme current];
+    _lastNight = t.night;
+    _current.theme = t;
+    [self applyBrightnessForTheme:t];
+    [_current tick];
+    SBYLog(@"screen woke: StandBy already in place");
 }
 
 // OLED (iPhone X) burn-in protection: nudge everything a few points every minute.
