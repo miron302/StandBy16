@@ -64,7 +64,10 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     BOOL _npDismissed, _timerDismissed;
     NSUInteger _tickCount;
 
-    NSTimer *_tickTimer, *_awakeTimer, *_shiftTimer, *_fadeTimer;
+    NSTimer *_tickTimer, *_awakeTimer, *_shiftTimer, *_fadeTimer, *_pollTimer;
+    CGSize _lastParentSize;
+    NSMutableArray<NSDictionary *> *_hiddenViews;
+    BOOL _loggedWindows;
     UIDeviceOrientation _orient;
     BOOL _landscape, _suppressed, _started, _pendingShow;
     CGPoint _shift;
@@ -79,6 +82,11 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     double _ax, _ay, _az;
     BOOL _haveAcc;
     NSDate *_lastMotion, *_lastWake;
+    BOOL _accelOrient, _onHost, _previewMode, _accelLand, _devLand;
+    UIDeviceOrientation _accelO, _devO;
+    NSUInteger _previewToken;
+    __weak UIViewController *_hostVC;
+    NSString *_lastLog;
 }
 
 + (instancetype)shared {
@@ -95,6 +103,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     _started = YES;
     _lastMotion = [NSDate distantPast];
     _lastWake = [NSDate distantPast];
+    SBYLog(@"started (iOS %@)", [UIDevice currentDevice].systemVersion);
 
     UIDevice *d = [UIDevice currentDevice];
     d.batteryMonitoringEnabled = YES;
@@ -110,12 +119,24 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &_blankToken, dispatch_get_main_queue(), ^(int t) { [weakSelf reevaluate]; });
 
     // Step aside for calls so the normal incoming-call UI is never covered.
-    _calls = [CTCallCenter new];
-    _calls.callEventHandler = ^(CTCall *call) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reevaluate]; });
-    };
+    @try {
+        _calls = [CTCallCenter new];
+        _calls.callEventHandler = ^(CTCall *call) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reevaluate]; });
+        };
+    } @catch (NSException *e) {
+        SBYLog(@"call center unavailable: %@", e);
+    }
 
     [SBYServices startMediaObserving];
+
+    // Settings switches post these Darwin notifications (PreferenceLoader "PostNotification").
+    static int pvTok, appTok;
+    notify_register_dispatch("com.miron302.standby16/preview", &pvTok, dispatch_get_main_queue(), ^(int t) { [weakSelf showPreview]; });
+    notify_register_dispatch("com.miron302.standby16/openapp", &appTok, dispatch_get_main_queue(), ^(int t) { [weakSelf openPreviewApp]; });
+
+    // Belt and braces: re-check every 2s in case a notification is missed (cheap, only logs on change).
+    _pollTimer = [NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(reevaluate) userInfo:nil repeats:YES];
 
     _orient = UIDeviceOrientationLandscapeLeft;
     [self orientationChanged];
@@ -124,37 +145,102 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 - (void)orientationChanged {
     UIDeviceOrientation o = [UIDevice currentDevice].orientation;
     if (o == UIDeviceOrientationLandscapeLeft || o == UIDeviceOrientationLandscapeRight) {
-        _orient = o;
-        _landscape = YES;
+        _devO = o;
+        _devLand = YES;
     } else if (o == UIDeviceOrientationPortrait || o == UIDeviceOrientationPortraitUpsideDown) {
-        _landscape = NO;
+        _devLand = NO;
     } // face up / face down / unknown: keep previous state
+    [self updateLandscape];
     [self reevaluate];
+}
+
+// Trigger method "Orientation detection": 0 accelerometer (default), 1 system (UIDevice), 2 either, 3 ignore.
+- (void)updateLandscape {
+    BOOL land = _landscape;
+    UIDeviceOrientation o = _orient;
+    switch ([SBYPrefs integerForKey:@"orientationMethod"]) {
+        case 1:
+            land = _devLand;
+            if (_devLand) o = _devO;
+            break;
+        case 2:
+            land = _accelLand || _devLand;
+            if (_accelLand) o = _accelO; else if (_devLand) o = _devO;
+            break;
+        case 3:
+            land = YES;
+            if (_accelLand) o = _accelO; else if (_devLand) o = _devO;
+            break;
+        default:
+            if (_accelOrient) { land = _accelLand; if (_accelLand) o = _accelO; }
+            else { land = _devLand; if (_devLand) o = _devO; }
+            break;
+    }
+    _landscape = land;
+    _orient = o;
 }
 
 #pragma mark - Activation rules (locked + charging + landscape + stationary + screen on)
 
-- (BOOL)isLocked { uint64_t st = 0; notify_get_state(_lockToken, &st); return st != 0; }
-- (BOOL)isScreenBlanked { uint64_t st = 0; notify_get_state(_blankToken, &st); return st != 0; }
+// Trigger method "Lock detection": 0 SpringBoard lock manager (default), 1 lock-state notification, 2 either.
+- (BOOL)isLocked {
+    NSInteger m = [SBYPrefs integerForKey:@"lockMethod"];
+    Class c = NSClassFromString(@"SBLockScreenManager");
+    id mgr = [c respondsToSelector:@selector(sharedInstance)] ? [c performSelector:@selector(sharedInstance)] : nil;
+    SEL sel = NSSelectorFromString(@"isUILocked");
+    BOOL haveMgr = [mgr respondsToSelector:sel];
+    BOOL viaMgr = haveMgr ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel) : NO;
+    uint64_t st = 0; notify_get_state(_lockToken, &st);
+    BOOL viaNotify = st != 0;
+    if (m == 1) return viaNotify;
+    if (m == 2) return viaMgr || viaNotify;
+    return haveMgr ? viaMgr : viaNotify;
+}
+// Trigger method "Screen state": 0 backlight controller (default), 1 blank-screen notification, 2 ignore.
+- (BOOL)isScreenBlanked {
+    NSInteger m = [SBYPrefs integerForKey:@"screenMethod"];
+    if (m == 2) return NO;
+    uint64_t st = 0; notify_get_state(_blankToken, &st);
+    BOOL viaNotify = st != 0;
+    if (m == 1) return viaNotify;
+    Class bl = NSClassFromString(@"SBBacklightController");
+    id inst = [bl respondsToSelector:@selector(sharedInstance)] ? [bl performSelector:@selector(sharedInstance)] : nil;
+    SEL sel = NSSelectorFromString(@"screenIsOn");
+    if ([inst respondsToSelector:sel]) return !((BOOL (*)(id, SEL))objc_msgSend)(inst, sel);
+    return viaNotify;
+}
 - (BOOL)callActive { return _calls.currentCalls.count > 0; }
 
 - (void)reevaluate { [self reevaluateAllowingDelay:YES]; }
 
 - (void)reevaluateAllowingDelay:(BOOL)delay {
+    @try { [self reevaluateNow:delay]; }
+    @catch (NSException *e) { SBYLog(@"exception in reevaluate: %@", e); }
+}
+
+- (void)reevaluateNow:(BOOL)delay {
+    if (_previewMode) return;
+    [self updateLandscape]; // picks up a changed orientation method within one poll // a manual preview owns the screen until it ends
     BOOL charging = ![SBYPrefs requireCharging] || [SBYServices isCharging];
     BOOL locked = [self isLocked];
     BOOL enabled = [SBYPrefs enabled];
-    if (!(charging && locked && _landscape)) _suppressed = NO;
+    BOOL force = [SBYPrefs boolForKey:@"forceShow"]; // test mode: ignore charging + rotation (still needs the phone locked)
+    if (!(force ? locked : (charging && locked && _landscape))) _suppressed = NO;
 
-    [self setMotionTracking:(enabled && locked && charging && _landscape)];
+    [self setMotionTracking:(enabled && locked && charging)];
 
-    BOOL ok = enabled && locked && ![self isScreenBlanked] && charging && _landscape && !_suppressed && ![self callActive];
+    BOOL ok = enabled && locked && ![self isScreenBlanked] && (force || (charging && _landscape)) && !_suppressed && ![self callActive];
+    NSString *state = [NSString stringWithFormat:@"force=%d enabled=%d locked=%d charging=%d landscape=%d blanked=%d call=%d suppressed=%d accel=%d host=%d methods(orient,lock,screen,still,overlay)=%ld%ld%ld%ld%ld -> %@",
+                       force, enabled, locked, charging, _landscape, [self isScreenBlanked], [self callActive], _suppressed, _accelOrient, _hostVC != nil,
+                       (long)[SBYPrefs integerForKey:@"orientationMethod"], (long)[SBYPrefs integerForKey:@"lockMethod"], (long)[SBYPrefs integerForKey:@"screenMethod"],
+                       (long)[SBYPrefs integerForKey:@"stillnessMethod"], (long)[SBYPrefs integerForKey:@"overlayMethod"], ok ? @"SHOW" : @"hide"];
+    if (![state isEqualToString:_lastLog]) { _lastLog = state; SBYLog(@"%@", state); }
     if (ok) {
-        if (_win) {
+        if (_content) {
             [self layoutContentAnimated:YES];
             return;
         }
-        BOOL settled = [[NSDate date] timeIntervalSinceDate:_lastMotion] > 0.8;
+        BOOL settled = force || [SBYPrefs integerForKey:@"stillnessMethod"] == 1 || [[NSDate date] timeIntervalSinceDate:_lastMotion] > 0.8; // stillness: 0 wait for the phone to settle (default), 1 off
         if (!delay && settled) { [self show]; return; }
         // Real StandBy waits until the phone has settled. Require ~0.8s of steady, still conditions.
         if (!_pendingShow) {
@@ -164,7 +250,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
                 [self reevaluateAllowingDelay:NO];
             });
         }
-    } else if (_win) {
+    } else if (_content) {
         [self hide];
     }
 }
@@ -175,6 +261,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     if (!on) {
         if (_motion.accelerometerActive) [_motion stopAccelerometerUpdates];
         _haveAcc = NO;
+        _accelOrient = NO;
         return;
     }
     if (!_motion) { _motion = [CMMotionManager new]; _motion.accelerometerUpdateInterval = 0.1; }
@@ -186,6 +273,19 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 }
 
 - (void)accel:(CMAcceleration)a {
+    // Accelerometer reads the direction of gravity in device coordinates (x to the right, y to the top).
+    // Phone turned counter-clockwise (top edge to the left): its left edge points down, so x ~ -1 = LandscapeLeft.
+    _accelOrient = YES;
+    if (fabs(a.x) > 0.65 && fabs(a.y) < 0.6 && fabs(a.z) < 0.85) {
+        _accelLand = YES;
+        _accelO = a.x < 0 ? UIDeviceOrientationLandscapeLeft : UIDeviceOrientationLandscapeRight;
+    } else if (fabs(a.y) > 0.65 && fabs(a.x) < 0.6 && fabs(a.z) < 0.85) {
+        _accelLand = NO;
+    } // flat / ambiguous: keep the previous state
+    BOOL beforeLand = _landscape;
+    UIDeviceOrientation beforeO = _orient;
+    [self updateLandscape];
+    if (beforeLand != _landscape || beforeO != _orient) [self reevaluate];
     if (_haveAcc) {
         double dv = sqrt(pow(a.x - _ax, 2) + pow(a.y - _ay, 2) + pow(a.z - _az, 2));
         if (dv > 0.05) _lastMotion = [NSDate date];
@@ -214,18 +314,40 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     if (!_brightnessSaved)
         [SBYTheme setAmbientDark:[UIScreen mainScreen].brightness < [SBYPrefs ambientThreshold]];
 
-    CGRect sb = [UIScreen mainScreen].fixedCoordinateSpace.bounds;
-    _win = [[UIWindow alloc] initWithFrame:sb];
-    _win.windowLevel = [SBYPrefs integerForKey:@"windowLevel"];
-    _win.backgroundColor = [UIColor blackColor];
-    if ([_win respondsToSelector:@selector(_setSecure:)]) [_win _setSecure:YES];
-    _win.rootViewController = [UIViewController new];
-    _win.rootViewController.view.backgroundColor = [UIColor blackColor];
+    UIViewController *hv = _hostVC ?: [self lookupCoverSheetVC];
+    if (hv && !_hostVC) { _hostVC = hv; SBYLog(@"lock screen view controller found at show time: %@", NSStringFromClass([hv class])); }
+    UIView *host = (!_previewMode && hv.isViewLoaded && [SBYPrefs integerForKey:@"overlayMethod"] != 1 && ![SBYPrefs boolForKey:@"forceWindow"]) ? hv.view : nil; // overlay: 0 inside the lock screen (default), 1 separate window
+    _onHost = host != nil;
 
     _content = [UIView new];
     _content.backgroundColor = [UIColor blackColor];
     _content.clipsToBounds = YES;
-    [_win.rootViewController.view addSubview:_content];
+
+    if (host) {
+        // Add to the lock screen's whole window (not just its view controller's view) so nothing can sit above us.
+        UIView *parent = host.window ?: host;
+        _content.frame = parent.bounds;
+        [parent addSubview:_content];
+        SBYLog(@"showing overlay inside the lock screen (parent %@ bounds %@)", NSStringFromClass([parent class]), NSStringFromCGRect(parent.bounds));
+    } else {
+        // Fallback: a separate high-level window.
+        CGRect sb = [UIScreen mainScreen].fixedCoordinateSpace.bounds;
+        UIWindowScene *scene = nil;
+        if ([SBYPrefs boolForKey:@"useWindowScene"]) {
+            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes)
+                if ([sc isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)sc; break; }
+        }
+        _win = scene ? [[UIWindow alloc] initWithWindowScene:scene] : [[UIWindow alloc] initWithFrame:sb];
+        _win.frame = sb;
+        _win.windowLevel = [SBYPrefs integerForKey:@"windowLevel"];
+        _win.backgroundColor = [UIColor blackColor];
+        if ([_win respondsToSelector:@selector(_setSecure:)]) [_win _setSecure:YES];
+        _win.rootViewController = [UIViewController new];
+        _win.rootViewController.view.backgroundColor = [UIColor blackColor];
+        _content.frame = sb;
+        [_win.rootViewController.view addSubview:_content];
+        SBYLog(@"showing overlay in a separate window (scene=%d level=%ld)", scene != nil, (long)[SBYPrefs integerForKey:@"windowLevel"]);
+    }
     [_content addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     [_content addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tap:)]];
     [_content addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPress:)]];
@@ -246,9 +368,16 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
     [_content addSubview:_current];
 
     [self layoutContentAnimated:NO];
-    _win.alpha = 0;
+    _content.alpha = 0;
+    _current.transform = CGAffineTransformMakeScale(0.93, 0.93);
     _win.hidden = NO;
-    [UIView animateWithDuration:0.6 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{ self->_win.alpha = 1; } completion:nil];
+    _loggedWindows = NO;
+    [self hideSiblings];
+    [self hideSystemChrome];
+    [UIView animateWithDuration:0.8 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0.2 options:0 animations:^{
+        self->_content.alpha = 1;
+        self->_current.transform = CGAffineTransformIdentity;
+    } completion:nil];
 
     SBYTheme *t = [SBYTheme current];
     _current.theme = t;
@@ -278,8 +407,13 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
         [UIScreen mainScreen].brightness = _savedBrightness;
         _brightnessSaved = NO;
     }
-    UIWindow *gone = _win;
-    [UIView animateWithDuration:0.25 animations:^{ gone.alpha = 0; } completion:^(BOOL f) { gone.hidden = YES; }];
+    [self restoreHidden];
+    UIView *goneContent = _content;
+    UIWindow *goneWin = _win;
+    [UIView animateWithDuration:0.25 animations:^{ goneContent.alpha = 0; } completion:^(BOOL f) {
+        [goneContent removeFromSuperview];
+        goneWin.hidden = YES;
+    }];
     _win = nil; _content = nil; _swatch = nil; _banner = nil;
     _widgets = nil; _clockStyles = nil; _nowPlaying = nil; _timerPage = nil; _current = nil;
 }
@@ -304,9 +438,10 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 #pragma mark - Layout (the lock screen is portrait-only, so rotate our content by hand)
 
 - (void)layoutContentAnimated:(BOOL)animated {
-    if (!_content) return;
-    CGRect sb = [UIScreen mainScreen].fixedCoordinateSpace.bounds;
+    if (!_content || !_content.superview) return;
+    CGRect sb = _content.superview.bounds;
     CGFloat angle = (_orient == UIDeviceOrientationLandscapeLeft) ? M_PI_2 : -M_PI_2;
+    if ([SBYPrefs integerForKey:@"orientationFlip"] == 1) angle += M_PI; // trigger method: flip direction
     void (^apply)(void) = ^{
         self->_content.transform = CGAffineTransformIdentity;
         self->_content.bounds = CGRectMake(0, 0, sb.size.height, sb.size.width);
@@ -321,10 +456,25 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 #pragma mark - Timers
 
 - (void)tick {
+    @try { [self tickNow]; }
+    @catch (NSException *e) { SBYLog(@"exception in tick: %@", e); }
+}
+
+- (void)tickNow {
     if (!_current) return;
+    // The lock screen may reorder or resize its views; keep StandBy on top and sized to its parent.
+    UIView *parent = _content.superview;
+    if (parent) {
+        if (parent.subviews.lastObject != _content) [parent bringSubviewToFront:_content];
+        if (!CGSizeEqualToSize(parent.bounds.size, _lastParentSize)) {
+            _lastParentSize = parent.bounds.size;
+            [self layoutContentAnimated:NO];
+        }
+    }
     if ([self callActive]) { [self reevaluate]; return; }
     _tickCount++;
     if (_tickCount % 8 == 0) [SBYServices refreshNowPlaying];
+    if (_tickCount % 4 == 0) { [self hideSiblings]; [self hideSystemChrome]; }
 
     SBYPageView *want = [self desiredOverlay] ?: [self baseView];
     if (want != _current) [self swapTo:want dx:0 dy:0];
@@ -341,6 +491,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 // Night mode dims hard, like StandBy. (We can only sample ambient light before we dim,
 // so the dark/light decision is refreshed each time StandBy appears.)
 - (void)applyBrightnessForTheme:(SBYTheme *)t {
+    if (_previewMode) return; // never dim the screen for a preview
     CGFloat nb = [SBYPrefs nightBrightness];
     if (t.night && nb > 0) {
         if (!_brightnessSaved) {
@@ -395,8 +546,45 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 //  tap                     -> Now Playing controls, stack editor
 //  long press              -> Clock: cycle colour / Widgets: edit the stack
 
+static CGFloat SBYRubber(CGFloat v) { return copysign(MIN(fabs(v) * 0.4, 70.0), v); }
+
 - (void)pan:(UIPanGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateEnded || !_current) return;
+    if (!_current) return;
+    switch (g.state) {
+        case UIGestureRecognizerStateChanged: [self panFollow:g]; break;
+        case UIGestureRecognizerStateEnded:   if (![self panEnded:g]) [self settleCurrent]; break;
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:  [self settleCurrent]; break;
+        default: break;
+    }
+}
+
+// The page follows your finger (with rubber-band resistance) while you swipe.
+- (void)panFollow:(UIPanGestureRecognizer *)g {
+    if ([_current isEditing]) return;
+    CGPoint tr = [g translationInView:_content];
+    CGPoint loc = [g locationInView:_content];
+    if (loc.y - tr.y > _content.bounds.size.height - 70) return; // bottom-edge exit swipe: don't drag the page
+    BOOL overlay = (_current == _nowPlaying || _current == _timerPage);
+    BOOL horiz = fabs(tr.x) >= fabs(tr.y);
+    CGFloat dx = (overlay || horiz) ? tr.x : 0;
+    CGFloat dy = (overlay || (!horiz && _current != _widgets)) ? tr.y : 0;
+    _current.transform = CGAffineTransformMakeTranslation(SBYRubber(dx), SBYRubber(dy));
+    _current.alpha = 1.0 - MIN(0.35, hypot(dx, dy) / 300.0);
+}
+
+// Spring back when the swipe didn't lead anywhere.
+- (void)settleCurrent {
+    UIView *c = _current;
+    [UIView animateWithDuration:0.55 delay:0 usingSpringWithDamping:0.72 initialSpringVelocity:0.3
+                        options:UIViewAnimationOptionAllowUserInteraction animations:^{
+        c.transform = CGAffineTransformIdentity;
+        c.alpha = 1;
+    } completion:nil];
+}
+
+// Returns YES if the swipe did something (page change / dismiss / leave StandBy).
+- (BOOL)panEnded:(UIPanGestureRecognizer *)g {
     CGPoint tr = [g translationInView:_content];
     CGPoint loc = [g locationInView:_content];
     CGPoint vel = [g velocityInView:_content];
@@ -405,17 +593,19 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 
     if (start.y > _content.bounds.size.height - 70 && (tr.y < -50 || fastY) && tr.y < 0 && fabs(tr.y) > fabs(tr.x)) {
         _suppressed = YES;
+        _previewMode = NO;
         [self hide];
-        return;
+        return YES;
     }
     if (_current == _nowPlaying || _current == _timerPage) {
         if (hypot(tr.x, tr.y) > 60 || fastX || fastY) {
             if (_current == _nowPlaying) _npDismissed = YES; else _timerDismissed = YES;
             [self swapTo:[self baseView] dx:(tr.x < 0 ? 1 : -1) dy:0];
+            return YES;
         }
-        return;
+        return NO;
     }
-    if ([_current isEditing]) return;
+    if ([_current isEditing]) return NO;
 
     if (fabs(tr.x) > fabs(tr.y) && (fabs(tr.x) > 60 || fastX)) {
         NSInteger target = _viewIndex + (tr.x < 0 ? 1 : -1);
@@ -423,6 +613,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
             _viewIndex = target;
             [SBYPrefs setInteger:_viewIndex forKey:@"lastView"];
             [self swapTo:[self baseView] dx:(tr.x < 0 ? 1 : -1) dy:0];
+            return YES;
         }
     } else if (fabs(tr.y) > 60 || fastY) {
         int d = tr.y < 0 ? 1 : -1; // swipe up = next
@@ -432,11 +623,13 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
                 _styleIndex = ni;
                 [SBYPrefs setInteger:ni forKey:@"lastStyle"];
                 [self swapTo:_clockStyles[ni] dx:0 dy:d];
+                return YES;
             }
         } else {
             [_widgets scrollStack:(start.x < _content.bounds.size.width / 2 ? 0 : 1) by:d];
         }
     }
+    return NO;
 }
 
 - (void)tap:(UITapGestureRecognizer *)g {
@@ -501,7 +694,7 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
 #pragma mark - Notifications (enlarged banner)
 
 - (void)showBannerApp:(NSString *)app title:(NSString *)title message:(NSString *)message sectionID:(NSString *)sid {
-    if (!_win || !_content || ![SBYPrefs boolForKey:@"notifications"]) return;
+    if (!_content || ![SBYPrefs boolForKey:@"notifications"]) return;
     if (!title.length && !message.length) return;
     SBYTheme *t = [SBYTheme current];
     CGFloat W = _content.bounds.size.width, H = _content.bounds.size.height;
@@ -550,6 +743,113 @@ enum { SBYViewWidgets = 0, SBYViewClock = 1 };
         [UIView animateWithDuration:0.35 animations:^{ v.frame = CGRectOffset(v.frame, 0, -(bh + H * 0.06)); }
                          completion:^(BOOL f) { [v removeFromSuperview]; }];
     });
+}
+
+#pragma mark - Lock screen host
+
+- (UIViewController *)lookupCoverSheetVC {
+    NSArray *pairs = @[ @[@"SBLockScreenManager", @"coverSheetViewController"],
+                        @[@"SBCoverSheetPresentationManager", @"coverSheetViewController"] ];
+    for (NSArray *p in pairs) {
+        Class c = NSClassFromString(p[0]);
+        id inst = [c respondsToSelector:@selector(sharedInstance)] ? [c performSelector:@selector(sharedInstance)] : nil;
+        SEL sel = NSSelectorFromString(p[1]);
+        if ([inst respondsToSelector:sel]) {
+            id vc = [inst performSelector:sel];
+            if ([vc isKindOfClass:[UIViewController class]]) return vc;
+        }
+    }
+    return nil;
+}
+
+- (void)setCoverSheetViewController:(UIViewController *)vc {
+    if (_hostVC != vc) {
+        _hostVC = vc;
+        SBYLog(@"lock screen view controller captured: %@", NSStringFromClass([vc class]));
+    }
+}
+
+#pragma mark - Manual preview (Settings > StandBy16 > Preview)
+
+// Shows StandBy for ~25s in a separate window over whatever is on screen, even when unlocked,
+// ignoring every trigger condition. Swipe up from the bottom edge to close it early.
+- (void)showPreview {
+    SBYLog(@"preview requested from Settings");
+    _previewMode = YES;
+    NSUInteger tok = ++_previewToken;
+    if (_content) [self hide];
+    [self show];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self->_previewMode && self->_previewToken == tok) [self endPreview];
+    });
+}
+
+- (void)endPreview {
+    _previewMode = NO;
+    if (_content) [self hide];
+    [self reevaluate];
+}
+
+// Launches the StandBy16 preview app (same pages, ordinary landscape app).
+- (void)openPreviewApp {
+    Class ws = NSClassFromString(@"LSApplicationWorkspace");
+    id w = [ws respondsToSelector:@selector(defaultWorkspace)] ? [ws performSelector:@selector(defaultWorkspace)] : nil;
+    SEL s = NSSelectorFromString(@"openApplicationWithBundleID:");
+    BOOL ok = NO;
+    if ([w respondsToSelector:s]) ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(w, s, @"com.miron302.standby16.preview");
+    SBYLog(@"open preview app -> %d", ok);
+}
+
+#pragma mark - Hiding the iOS lock screen UI while StandBy is up
+
+static BOOL SBYIsChromeClass(NSString *cn) {
+    for (NSString *k in @[@"StatusBar", @"HomeGrabber", @"HomeAffordance", @"HomeIndicator", @"Grabber"])
+        if ([cn containsString:k]) return YES;
+    return NO;
+}
+
+- (void)hideView:(UIView *)v {
+    if (!v || v == _content) return;
+    if (!_hiddenViews) _hiddenViews = [NSMutableArray array];
+    for (NSDictionary *d in _hiddenViews)
+        if (d[@"v"] == v) { if (v.alpha != 0) v.alpha = 0; return; } // already ours: keep it hidden
+    if (v.alpha < 0.01) return;  // the lock screen hid it itself; don't touch it
+    [_hiddenViews addObject:@{ @"v": v, @"a": @(v.alpha) }];
+    SBYLog(@"hiding system view %@", NSStringFromClass([v class]));
+    [UIView animateWithDuration:0.3 animations:^{ v.alpha = 0; }];
+}
+
+// Everything else inside the lock screen's window (torch, camera, padlock, "Swipe up to unlock", clock...).
+- (void)hideSiblings {
+    if (![SBYPrefs boolForKey:@"hideSystemUI"] || !_onHost || !_content.superview) return;
+    for (UIView *v in [_content.superview.subviews copy]) if (v != _content) [self hideView:v];
+}
+
+- (void)scanHide:(UIView *)v depth:(int)depth {
+    if (depth > 6 || v == _content) return;
+    if (SBYIsChromeClass(NSStringFromClass([v class]))) { [self hideView:v]; return; }
+    for (UIView *s in [v.subviews copy]) [self scanHide:s depth:depth + 1];
+}
+
+// Status bar and home indicator live in their own windows.
+- (void)hideSystemChrome {
+    if (![SBYPrefs boolForKey:@"hideSystemUI"] || !_content) return;
+    UIWindow *own = _content.window;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (!_loggedWindows) SBYLog(@"window %@ level=%.0f alpha=%.2f hidden=%d", NSStringFromClass([w class]), w.windowLevel, w.alpha, w.hidden);
+        if (w == _win || w == own) continue;
+        [self scanHide:w depth:0];
+    }
+    _loggedWindows = YES;
+}
+
+- (void)restoreHidden {
+    NSArray *items = _hiddenViews;
+    _hiddenViews = nil;
+    if (!items.count) return;
+    [UIView animateWithDuration:0.3 animations:^{
+        for (NSDictionary *d in items) ((UIView *)d[@"v"]).alpha = [d[@"a"] doubleValue];
+    }];
 }
 
 @end

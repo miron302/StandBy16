@@ -40,3 +40,8 @@ void SBYDrawTextFit(NSString *s, UIFont *font, UIColor *color, CGRect target);
 // Draws text vertically centered on its cap height. maxWidth<=0 means no limit.
 void SBYDrawTextAt(NSString *s, UIFont *font, UIColor *color, CGPoint anchor, NSTextAlignment align, CGFloat maxWidth);
 void SBYDrawSymbol(NSString *name, UIColor *color, CGRect rect);
+
+// Logging goes to the system log AND /var/mobile/Library/Logs/StandBy16.log (open it with Filza, no PC needed).
+// Turn it off with the `debug` setting.
+void SBYLogf(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+#define SBYLog(fmt, ...) do { if ([SBYPrefs boolForKey:@"debug"]) SBYLogf(fmt, ##__VA_ARGS__); } while (0)

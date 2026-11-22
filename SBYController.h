@@ -7,4 +7,6 @@
 - (void)start;
 // Enlarged notification banner (called from the BBServer hooks in Tweak.x).
 - (void)showBannerApp:(NSString *)app title:(NSString *)title message:(NSString *)message sectionID:(NSString *)sectionID;
+// Called from the CSCoverSheetViewController hook in Tweak.x.
+- (void)setCoverSheetViewController:(UIViewController *)vc;
 @end

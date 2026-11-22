@@ -31,6 +31,17 @@
             @"nowPlaying": @YES,
             @"timerActivity": @YES,
             @"windowLevel": @10000,
+            @"useWindowScene": @NO,
+            @"forceWindow": @NO,
+            @"debug": @YES,
+            @"forceShow": @NO,
+            @"orientationMethod": @0,
+            @"lockMethod": @0,
+            @"screenMethod": @0,
+            @"stillnessMethod": @0,
+            @"overlayMethod": @0,
+            @"orientationFlip": @0,
+            @"hideSystemUI": @YES,
             @"leftOrder": @"0,1,2",
             @"rightOrder": @"3,4,5",
         }];
@@ -183,4 +194,30 @@ void SBYDrawSymbol(NSString *name, UIColor *color, CGRect rect) {
     CGFloat k = MIN(rect.size.width / s.width, rect.size.height / s.height);
     CGRect r = CGRectMake(CGRectGetMidX(rect) - s.width * k / 2, CGRectGetMidY(rect) - s.height * k / 2, s.width * k, s.height * k);
     [img drawInRect:r];
+}
+
+#pragma mark - Logging
+
+void SBYLogf(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"StandBy16: %@", msg);
+
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("com.miron302.standby16.log", DISPATCH_QUEUE_SERIAL); });
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    dispatch_async(q, ^{
+        NSString *path = @"/var/mobile/Library/Logs/StandBy16.log";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        if ([attrs fileSize] > 64 * 1024) [fm removeItemAtPath:path error:nil]; // keep it small
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    });
 }

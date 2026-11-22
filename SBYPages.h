@@ -4,6 +4,7 @@
 // Base class: opaque black page, redraws itself on -tick.
 @interface SBYPageView : UIView
 @property (nonatomic, strong) SBYTheme *theme;
+@property (nonatomic) BOOL minuteTransition; // cross-dissolve when the minute changes (default YES)
 - (void)tick;
 - (CGRect)safeRect;                                   // inset for the notch / rounded corners
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b; // subclasses override

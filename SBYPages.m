@@ -30,7 +30,9 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
 
 #pragma mark - Base
 
-@implementation SBYPageView
+@implementation SBYPageView {
+    NSString *_lastTime;
+}
 @synthesize theme = _theme;
 
 - (instancetype)initWithFrame:(CGRect)f {
@@ -39,12 +41,24 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
         self.opaque = YES;
         self.contentMode = UIViewContentModeRedraw;
         self.clearsContextBeforeDrawing = NO;
+        _minuteTransition = YES;
     }
     return self;
 }
 - (SBYTheme *)theme { return _theme ?: [SBYTheme current]; }
 - (void)setTheme:(SBYTheme *)t { _theme = t; [self setNeedsDisplay]; }
-- (void)tick { [self setNeedsDisplay]; }
+- (void)tick {
+    NSString *ts = [SBYServices timeString];
+    BOOL changed = _lastTime && ![ts isEqualToString:_lastTime];
+    _lastTime = ts;
+    if (changed && self.minuteTransition && self.window) {
+        // soft cross-dissolve when the time changes, like iOS does
+        [UIView transitionWithView:self duration:0.4 options:UIViewAnimationOptionTransitionCrossDissolve
+                        animations:^{ [self setNeedsDisplay]; } completion:nil];
+        return;
+    }
+    [self setNeedsDisplay];
+}
 - (CGRect)safeRect { return CGRectInset(self.bounds, 46, 8); }
 - (void)drawRect:(CGRect)rect {
     CGContextRef c = UIGraphicsGetCurrentContext();
@@ -130,6 +144,10 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
 #pragma mark - Analog
 
 @implementation SBYAnalogPageView
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) self.minuteTransition = NO;
+    return self;
+}
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
     SBYTheme *t = self.theme;
     CGFloat w = b.size.width, h = b.size.height, s = w / 896.0;
@@ -501,6 +519,7 @@ static const SBYWidgetFn kWidgetFns[SBY_WIDGET_N] = { SBYWidgetClock, SBYWidgetA
         _idx[0] = MAX(0, MIN((NSInteger)_orderL.count - 1, [SBYPrefs integerForKey:@"leftStack"]));
         _idx[1] = MAX(0, MIN((NSInteger)_orderR.count - 1, [SBYPrefs integerForKey:@"rightStack"]));
         _editing = -1;
+        self.minuteTransition = NO;
         _lastTouch = CACurrentMediaTime();
     }
     return self;
@@ -639,19 +658,16 @@ static const SBYWidgetFn kWidgetFns[SBY_WIDGET_N] = { SBYWidgetClock, SBYWidgetA
 
 #pragma mark - Now Playing (full-screen takeover while media plays)
 
-@implementation SBYNowPlayingPageView {
-    CGRect _ctrl[3]; // previous, play/pause, next
-}
-
-- (BOOL)handleTapAt:(CGPoint)p {
-    int cmds[3] = { 5, 2, 4 };
-    for (int i = 0; i < 3; i++) {
-        if (CGRectContainsPoint(CGRectInset(_ctrl[i], -14, -14), p)) {
-            [SBYServices sendMediaCommand:cmds[i]];
-            return YES;
-        }
-    }
-    return NO;
+// A 12x12 copy of the artwork; scaled up with smoothing it becomes a colour glow for the backdrop.
+static UIImage *SBYTinyImage(UIImage *src) {
+    if (!src) return nil;
+    CGSize s = CGSizeMake(12, 12);
+    UIGraphicsBeginImageContextWithOptions(s, YES, 1);
+    CGContextSetInterpolationQuality(UIGraphicsGetCurrentContext(), kCGInterpolationMedium);
+    [src drawInRect:CGRectMake(0, 0, s.width, s.height)];
+    UIImage *o = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return o;
 }
 
 static NSString *SBYClockText(double sec) {
@@ -659,18 +675,110 @@ static NSString *SBYClockText(double sec) {
     return [NSString stringWithFormat:@"%ld:%02ld", s / 60, s % 60];
 }
 
+@implementation SBYNowPlayingPageView {
+    CGRect _ctrl[3]; // previous, play/pause, next
+    UIImage *_lastArt, *_tiny;
+    NSString *_lastTitle;
+    NSInteger _pressed;
+    CGFloat _artScale;
+    NSTimer *_animTimer;
+}
+
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) {
+        self.minuteTransition = NO;
+        _artScale = 1;
+        _pressed = -1;
+    }
+    return self;
+}
+
+- (void)willMoveToSuperview:(UIView *)v {
+    [super willMoveToSuperview:v];
+    if (!v) { [_animTimer invalidate]; _animTimer = nil; }
+}
+
+- (CGFloat)targetScale {
+    return [[SBYServices nowPlaying][@"playing"] boolValue] ? 1.0 : 0.86; // artwork shrinks when paused
+}
+
+- (void)tick {
+    NSString *title = [SBYServices nowPlaying][@"title"];
+    if (title && _lastTitle && ![title isEqualToString:_lastTitle] && self.window) {
+        _lastTitle = title; // new track: dissolve to the new artwork and text
+        [UIView transitionWithView:self duration:0.45 options:UIViewAnimationOptionTransitionCrossDissolve
+                        animations:^{ [self setNeedsDisplay]; } completion:nil];
+    } else {
+        _lastTitle = title;
+        [super tick];
+    }
+    if (fabs(_artScale - [self targetScale]) > 0.003 && !_animTimer)
+        _animTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60 target:self selector:@selector(animStep) userInfo:nil repeats:YES];
+}
+
+- (void)animStep {
+    CGFloat target = [self targetScale];
+    _artScale += (target - _artScale) * 0.16;
+    if (fabs(_artScale - target) < 0.003) { _artScale = target; [_animTimer invalidate]; _animTimer = nil; }
+    [self setNeedsDisplay];
+}
+
+- (BOOL)handleTapAt:(CGPoint)p {
+    int cmds[3] = { 5, 2, 4 };
+    for (int i = 0; i < 3; i++) {
+        if (CGRectContainsPoint(CGRectInset(_ctrl[i], -16, -16), p)) {
+            _pressed = i;
+            [self setNeedsDisplay];
+            [SBYServices sendMediaCommand:cmds[i]];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                self->_pressed = -1;
+                [self setNeedsDisplay];
+            });
+            return YES;
+        }
+    }
+    return NO;
+}
+
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
     SBYTheme *t = self.theme;
     NSDictionary *np = [SBYServices nowPlaying];
     if (!np) return;
     CGFloat w = b.size.width, h = b.size.height;
-    CGFloat side = h * 0.72;
-    CGRect art = CGRectMake(MAX(46, w * 0.07), (h - side) / 2, side, side);
-    UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:art cornerRadius:side * 0.06];
+    UIImage *img = np[@"artwork"];
+    if (img != _lastArt) { _lastArt = img; _tiny = SBYTinyImage(img); }
+
+    // Backdrop: a soft glow taken from the artwork (red glow in night mode)
+    if (t.night) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        NSArray *cols = @[ (id)[t.bright colorWithAlphaComponent:0.22].CGColor, (id)[t.bright colorWithAlphaComponent:0].CGColor ];
+        CGGradientRef g = CGGradientCreateWithColors(cs, (__bridge CFArrayRef)cols, NULL);
+        CGContextDrawRadialGradient(c, g, CGPointMake(w * 0.25, h * 0.5), 0, CGPointMake(w * 0.25, h * 0.5), h, 0);
+        CGGradientRelease(g);
+        CGColorSpaceRelease(cs);
+    } else if (_tiny) {
+        CGContextSaveGState(c);
+        CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
+        [_tiny drawInRect:b blendMode:kCGBlendModeNormal alpha:0.6];
+        CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0 alpha:0.5].CGColor);
+        CGContextFillRect(c, b);
+        CGContextRestoreGState(c);
+    }
+
+    // Artwork (scales down while paused), with a soft drop shadow
+    CGFloat full = h * 0.7;
+    CGFloat side = full * _artScale;
+    CGFloat left = MAX(46, w * 0.06);
+    CGRect art = CGRectMake(left + (full - side) / 2, (h - side) / 2, side, side);
+    UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:art cornerRadius:side * 0.07];
+    CGContextSaveGState(c);
+    CGContextSetShadowWithColor(c, CGSizeMake(0, 10), 28, [UIColor colorWithWhite:0 alpha:0.55].CGColor);
+    [[UIColor blackColor] setFill];
+    [clip fill];
+    CGContextRestoreGState(c);
 
     CGContextSaveGState(c);
     [clip addClip];
-    UIImage *img = np[@"artwork"];
     if (img) {
         [img drawInRect:art];
         if (t.night) { // collapse artwork to the red monochrome treatment
@@ -685,33 +793,37 @@ static NSString *SBYClockText(double sec) {
     }
     CGContextRestoreGState(c);
 
-    CGFloat x0 = CGRectGetMaxX(art) + w * 0.05, x1 = w - 46, tw = x1 - x0;
-    SBYDrawTextAt(np[@"title"], [UIFont systemFontOfSize:h * 0.085 weight:UIFontWeightSemibold], t.bright,
-                  CGPointMake(x0, h * 0.26), NSTextAlignmentLeft, tw);
+    CGFloat x0 = left + full + w * 0.05, x1 = w - 46, tw = x1 - x0;
+    SBYDrawTextAt(np[@"title"], [UIFont systemFontOfSize:h * 0.085 weight:UIFontWeightBold], t.bright,
+                  CGPointMake(x0, h * 0.27), NSTextAlignmentLeft, tw);
     if (np[@"artist"])
-        SBYDrawTextAt(np[@"artist"], [UIFont systemFontOfSize:h * 0.07 weight:UIFontWeightMedium], t.dim,
-                      CGPointMake(x0, h * 0.37), NSTextAlignmentLeft, tw);
+        SBYDrawTextAt(np[@"artist"], [UIFont systemFontOfSize:h * 0.07 weight:UIFontWeightMedium], [t.primary colorWithAlphaComponent:0.7],
+                      CGPointMake(x0, h * 0.38), NSTextAlignmentLeft, tw);
 
+    // Progress
     double dur = [np[@"duration"] doubleValue], el = [np[@"elapsed"] doubleValue];
-    CGFloat by = h * 0.55;
+    CGFloat by = h * 0.56;
     CGRect track = CGRectMake(x0, by - 2.5, tw, 5);
-    [[t.faint colorWithAlphaComponent:0.8] setFill];
+    [[t.primary colorWithAlphaComponent:0.28] setFill];
     [[UIBezierPath bezierPathWithRoundedRect:track cornerRadius:2.5] fill];
     if (dur > 0) {
-        CGRect fill = track; fill.size.width = tw * MIN(1, el / dur);
-        [t.primary setFill];
+        CGRect fill = track; fill.size.width = MAX(5, tw * MIN(1, el / dur));
+        [t.bright setFill];
         [[UIBezierPath bezierPathWithRoundedRect:fill cornerRadius:2.5] fill];
-        UIFont *sf = [UIFont systemFontOfSize:h * 0.045 weight:UIFontWeightMedium];
-        SBYDrawTextAt(SBYClockText(el), sf, t.dim, CGPointMake(x0, by + h * 0.07), NSTextAlignmentLeft, 0);
-        SBYDrawTextAt([@"-" stringByAppendingString:SBYClockText(dur - el)], sf, t.dim, CGPointMake(x1, by + h * 0.07), NSTextAlignmentRight, 0);
+        UIFont *sf = [UIFont monospacedDigitSystemFontOfSize:h * 0.045 weight:UIFontWeightMedium];
+        SBYDrawTextAt(SBYClockText(el), sf, [t.primary colorWithAlphaComponent:0.7], CGPointMake(x0, by + h * 0.07), NSTextAlignmentLeft, 0);
+        SBYDrawTextAt([@"-" stringByAppendingString:SBYClockText(dur - el)], sf, [t.primary colorWithAlphaComponent:0.7],
+                      CGPointMake(x1, by + h * 0.07), NSTextAlignmentRight, 0);
     }
 
-    CGFloat cs = h * 0.11, cy = h * 0.8, cx = x0 + tw / 2, gap = tw * 0.28;
+    // Controls (the pressed one shrinks briefly)
+    CGFloat cs = h * 0.115, cy = h * 0.8, cx = x0 + tw / 2, gap = tw * 0.28;
     NSString *names[3] = { @"backward.fill", [np[@"playing"] boolValue] ? @"pause.fill" : @"play.fill", @"forward.fill" };
     for (int i = 0; i < 3; i++) {
         CGFloat px = cx + (i - 1) * gap;
         _ctrl[i] = CGRectMake(px - cs / 2, cy - cs / 2, cs, cs);
-        SBYDrawSymbol(names[i], t.bright, _ctrl[i]);
+        CGRect r = (i == _pressed) ? CGRectInset(_ctrl[i], cs * 0.14, cs * 0.14) : _ctrl[i];
+        SBYDrawSymbol(names[i], (i == _pressed) ? [t.bright colorWithAlphaComponent:0.7] : t.bright, r);
     }
 }
 @end
@@ -719,6 +831,10 @@ static NSString *SBYClockText(double sec) {
 #pragma mark - Timer (Live Activity style takeover)
 
 @implementation SBYTimerPageView
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) self.minuteTransition = NO;
+    return self;
+}
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
     SBYTheme *t = self.theme;
     NSTimeInterval rem = 0, tot = 1;

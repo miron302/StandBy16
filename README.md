@@ -21,7 +21,26 @@ It reopens on the last view/style you used. Night mode turns everything red-mono
 Activation = locked + charging + landscape + held still for ~0.8s. With motionToWake on, a night-mode screen
 that has slept wakes when it senses movement.
 
-## Build (on macOS, with Theos installed)
+## Check the package before installing
+After `make clean package`, confirm it is a rootless package:
+    dpkg-deb -I packages/*.deb | grep -E "Architecture|Depends"   # must say iphoneos-arm64
+    dpkg-deb -c packages/*.deb | head                              # paths must start with ./var/jb/
+If it says `iphoneos-arm`, the build was rootful and Sileo will refuse it on a rootless jailbreak
+("Depends mobilesubstrate:iphoneos-arm"). Always run `make clean` first so no stale staging folder is reused.
+
+## Already have a rootful .deb? Convert it on the phone (NewTerm, no computer)
+A build service that ignores the rootless setting produces `iphoneos-arm`, which Sileo refuses on a rootless jailbreak.
+StandBy16 has no rootful/rootless code differences, so the package can simply be repacked:
+    D=/path/to/com.miron302.standby16_1.0.1_iphoneos-arm.deb
+    rm -rf ~/sby && mkdir -p ~/sby
+    dpkg-deb -R "$D" ~/sby
+    mkdir -p ~/sby/var/jb
+    for d in Library Applications usr; do [ -d ~/sby/$d ] && mv ~/sby/$d ~/sby/var/jb/; done
+    sed -i 's/^Architecture: .*/Architecture: iphoneos-arm64/' ~/sby/DEBIAN/control
+    dpkg-deb --root-owner-group -b ~/sby ~/StandBy16_rootless.deb
+Then open ~/StandBy16_rootless.deb in Sileo/Filza to install it and respring.
+
+## Build (on your hackintosh, with Theos installed)
     export THEOS=~/theos
     make package
     make package install THEOS_DEVICE_IP=<iphone ip>     # or copy the .deb over and install it with Sileo/dpkg
@@ -29,7 +48,9 @@ that has slept wakes when it senses movement.
 Makefile is rootless (palera1n default). For a rootful jailbreak delete the `THEOS_PACKAGE_SCHEME` line.
 Then `killall -9 SpringBoard` (or just respring).
 
-## Settings (no prefs pane yet)
+## Settings
+Settings > StandBy16 (needs PreferenceLoader, installed automatically as a dependency). The same keys work with `defaults write`:
+
 Run on the phone as mobile, then respring if a value doesn't pick up:
     defaults write com.miron302.standby16 cityName -string "London"
     defaults write com.miron302.standby16 latitude -float 51.5072
@@ -77,4 +98,48 @@ is portrait only). Pixel shift every minute for OLED burn-in. Night mode = red p
    all runtime-looked-up private APIs; if one is missing on 16.7.x that single feature just stays quiet.
 6. Motion-to-wake calls -[SBBacklightController turnOnScreenFullyWithBacklightSource:] (selector may differ).
 
-Version: 1.0.0
+Version: 1.0.1
+
+## Previewing without the trigger sequence
+- Settings > StandBy16 > Preview > **Preview StandBy now** (flip the switch): shows StandBy for 25s in a separate window,
+  even unlocked. Swipe up from the bottom edge to close it early.
+- **Open preview app** (or tap the StandBy16 icon on the home screen): the same pages as an ordinary landscape app.
+  Swipe like real StandBy; double-tap toggles night mode; long-press for colours / stack editing.
+If the preview app looks right but the lock-screen version doesn't appear, the UI is fine and the problem is the
+trigger/hook, which the log will show.
+
+## Trigger method settings (advanced)
+Settings has a second entry, **StandBy16 Trigger Methods**. It lets you swap how each part of the trigger is detected:
+orientation (accelerometer / system / either / ignore), lock state (lock manager / notification / either),
+screen state (backlight / notification / ignore), settle delay (wait / off) and overlay (inside lock screen / separate window).
+The first option in every list is the stable default. Any change shows a WARNING popup: **Continue changing** applies it,
+**Cancel** puts that setting back to its default. The log line shows the active methods as
+`methods(orient,lock,screen,still,overlay)=00000`.
+If a method breaks the trigger, use **Reset all to defaults** at the bottom of that page.
+
+## Looks and feel
+- StandBy covers the whole lock screen: torch, camera, padlock, "Swipe up to unlock", the status bar and the home
+  indicator are hidden while it is up and restored (faded back in) when it closes. Turn this off with
+  Settings > StandBy16 > Troubleshooting > Hide iOS lock screen UI. The log lists every window and every system view
+  it hides, so anything that still shows can be targeted.
+- If it is rotated the wrong way, Settings > StandBy16 Trigger Methods > Orientation direction > Flipped 180°.
+- Pages follow your finger when you swipe (rubber-band) and spring back; page changes spring; the time dissolves when
+  the minute changes; Now Playing has an artwork-colour glow, the artwork shrinks while paused, and the buttons press.
+
+## Stability notes
+- Every state check and the 4Hz redraw run inside @try/@catch, so a bad value can't take SpringBoard down.
+- A 2s poll re-checks lock/charge/screen/orientation in case a system notification never arrives.
+- StandBy keeps itself on top of the lock screen's views and re-sizes if the lock screen re-lays out.
+- The log gets `dylib loaded in SpringBoard` as soon as the tweak is injected, and `started` once the controller runs.
+
+## If it does nothing
+StandBy now draws *inside* the lock screen (it hooks CSCoverSheetViewController) instead of a separate window.
+1. Check the tweak is loaded: after a respring, `/var/mobile/Library/Logs/StandBy16.log` should contain a `started` line
+   and `lock screen view controller captured`. No `started` line = the dylib isn't loading (check it is in
+   /var/jb/Library/MobileSubstrate/DynamicLibraries/ and that your jailbreak is rootless).
+2. Settings > StandBy16 > Troubleshooting > **Test mode**, respring, lock, wake the screen. StandBy should appear.
+3. Turn Test mode off, plug in, lock, turn sideways. The log shows
+       force=0 enabled=1 locked=1 charging=1 landscape=1 blanked=0 ... host=1 -> SHOW
+   Whichever field is wrong is the culprit (`host=0` means the lock screen controller was never captured;
+   try "Use separate window").
+With a computer, `idevicesyslog | grep StandBy16` shows the same lines live.
