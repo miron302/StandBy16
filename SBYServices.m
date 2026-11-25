@@ -33,7 +33,7 @@ NSString *const SBYServicesDidUpdate = @"SBYServicesDidUpdate";
 
 #pragma mark - Alarm (MobileTimer, loaded at runtime so nothing to link)
 
-+ (NSDate *)nextAlarmDate {
+static id SBYAlarmManagerInstance(void) {
     static id mgr;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -41,20 +41,30 @@ NSString *const SBYServicesDidUpdate = @"SBYServicesDidUpdate";
         Class c = NSClassFromString(@"MTAlarmManager");
         if (c) mgr = [[c alloc] init];
     });
+    return mgr;
+}
+
+// The next alarm object and its fire date (only if it is within the next 24 hours).
+static id SBYNextAlarmObject(NSDate **fireOut) {
+    id mgr = SBYAlarmManagerInstance();
     if (!mgr) return nil;
     @try {
-        id alarm = nil;
-        if ([mgr respondsToSelector:@selector(nextAlarmSync)]) alarm = [mgr performSelector:@selector(nextAlarmSync)];
-        if (!alarm) return nil;
-        NSDate *fire = nil;
-        if ([alarm respondsToSelector:@selector(nextFireDate)]) fire = [alarm performSelector:@selector(nextFireDate)];
+        id alarm = [mgr respondsToSelector:@selector(nextAlarmSync)] ? [mgr performSelector:@selector(nextAlarmSync)] : nil;
+        if (!alarm || ![alarm respondsToSelector:@selector(nextFireDate)]) return nil;
+        NSDate *fire = [alarm performSelector:@selector(nextFireDate)];
         if (![fire isKindOfClass:[NSDate class]]) return nil;
         NSTimeInterval dt = [fire timeIntervalSinceNow];
         if (dt < 0 || dt > 24 * 3600) return nil;
-        return fire;
+        if (fireOut) *fireOut = fire;
+        return alarm;
     } @catch (__unused NSException *e) {
         return nil;
     }
+}
+
++ (NSDate *)nextAlarmDate {
+    NSDate *fire = nil;
+    return SBYNextAlarmObject(&fire) ? fire : nil;
 }
 
 + (NSString *)alarmString {
@@ -244,5 +254,131 @@ static void SBYWeatherInfo(int code, BOOL day, NSString **sym, NSString **desc) 
         }];
     [t resume];
 }
+
+#pragma mark - Calls
+
+static NSString *sCallState;
+static NSDate *sCallConnectedAt;
+
+static id SBYCallCenter(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ dlopen("/System/Library/PrivateFrameworks/TelephonyUtilities.framework/TelephonyUtilities", RTLD_NOW); });
+    Class c = NSClassFromString(@"TUCallCenter");
+    return [c respondsToSelector:@selector(sharedInstance)] ? [c performSelector:@selector(sharedInstance)] : nil;
+}
+
+static id SBYTopCall(void) {
+    id cc = SBYCallCenter();
+    SEL sel = NSSelectorFromString(@"currentCalls");
+    NSArray *calls = [cc respondsToSelector:sel] ? [cc performSelector:sel] : nil;
+    if (![calls isKindOfClass:[NSArray class]] || !calls.count) return nil;
+    for (id call in calls) {            // prefer a ringing call
+        @try { if ([[call valueForKey:@"status"] intValue] == 4) return call; } @catch (__unused NSException *e) {}
+    }
+    return calls.firstObject;
+}
+
+static NSString *SBYCallString(id obj, NSString *key) {
+    @try { id v = [obj valueForKey:key]; return [v isKindOfClass:[NSString class]] && [v length] ? v : nil; }
+    @catch (__unused NSException *e) { return nil; }
+}
+
++ (BOOL)callAPIAvailable {
+    id cc = SBYCallCenter();
+    return cc && [cc respondsToSelector:NSSelectorFromString(@"currentCalls")]
+              && [cc respondsToSelector:NSSelectorFromString(@"answerCall:")]
+              && [cc respondsToSelector:NSSelectorFromString(@"disconnectCall:")];
+}
+
++ (void)setCallState:(NSString *)state {
+    if ([state isEqualToString:@"connected"] && ![sCallState isEqualToString:@"connected"]) sCallConnectedAt = [NSDate date];
+    if (![state isEqualToString:@"connected"]) sCallConnectedAt = nil;
+    sCallState = state;
+}
++ (NSString *)callState { return sCallState; }
+
++ (NSDictionary *)callInfo {
+    if (!sCallState) return nil;
+    id call = SBYTopCall();
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"state"] = sCallState;
+    NSString *name = SBYCallString(call, @"displayName");
+    NSString *number = nil;
+    @try { number = SBYCallString([call valueForKey:@"handle"], @"value"); } @catch (__unused NSException *e) {}
+    d[@"name"] = name ?: number ?: @"Unknown";
+    if (number) d[@"number"] = number;
+    if (sCallConnectedAt) d[@"since"] = sCallConnectedAt;
+    return d;
+}
+
++ (void)answerCall {
+    id cc = SBYCallCenter(), call = SBYTopCall();
+    SEL s = NSSelectorFromString(@"answerCall:");
+    if (call && [cc respondsToSelector:s]) [cc performSelector:s withObject:call];
+}
+
++ (void)endCall {
+    id cc = SBYCallCenter(), call = SBYTopCall();
+    SEL s = NSSelectorFromString(@"disconnectCall:");
+    if (call && [cc respondsToSelector:s]) [cc performSelector:s withObject:call];
+}
+
+#pragma mark - Ringing alarm (best effort)
+
+static NSDate *sWatchDate, *sRingingSince;
+static id sWatchAlarm, sRingingAlarm;
+static CFAbsoluteTime sLastAlarmCheck;
+
++ (void)updateAlarmState {
+    NSDate *now = [NSDate date];
+    // while the next alarm is close, check every call; otherwise every ~5 seconds
+    NSTimeInterval gap = (sWatchDate && [sWatchDate timeIntervalSinceNow] < 6) ? 0 : 5.0;
+    if (CFAbsoluteTimeGetCurrent() - sLastAlarmCheck < gap) return;
+    sLastAlarmCheck = CFAbsoluteTimeGetCurrent();
+
+    if (sRingingSince) {
+        if ([now timeIntervalSinceDate:sRingingSince] > 300) [self clearAlarmRinging]; // never stay up longer than 5 minutes
+    } else if (sWatchDate && [now compare:sWatchDate] != NSOrderedAscending) {
+        if ([now timeIntervalSinceDate:sWatchDate] < 120) { sRingingSince = sWatchDate; sRingingAlarm = sWatchAlarm; }
+        sWatchDate = nil; sWatchAlarm = nil;
+    }
+    NSDate *next = nil;
+    id alarm = SBYNextAlarmObject(&next);
+    if (alarm && [next timeIntervalSinceDate:now] > 0) {
+        if (![next isEqualToDate:sWatchDate]) { sWatchDate = next; sWatchAlarm = alarm; }
+    } else if (!alarm && sWatchDate && [sWatchDate timeIntervalSinceDate:now] > 0) {
+        sWatchDate = nil; sWatchAlarm = nil;   // the alarm was turned off or deleted
+    }
+}
+
++ (BOOL)alarmRinging { return sRingingSince != nil; }
+
++ (BOOL)alarmAPIAvailable {
+    id m = SBYAlarmManagerInstance();
+    return m && [m respondsToSelector:NSSelectorFromString(@"snoozeAlarmWithIdentifier:")]
+             && [m respondsToSelector:NSSelectorFromString(@"dismissAlarmWithIdentifier:")];
+}
+
++ (NSDictionary *)ringingAlarm {
+    if (!sRingingSince) return nil;
+    NSString *label = SBYCallString(sRingingAlarm, @"title") ?: SBYCallString(sRingingAlarm, @"label");
+    return @{ @"label": label ?: @"Alarm", @"since": sRingingSince };
+}
+
+static void SBYAlarmAction(NSString *selName) {
+    id m = SBYAlarmManagerInstance();
+    SEL sel = NSSelectorFromString(selName);
+    if (!sRingingAlarm || ![m respondsToSelector:sel]) return;
+    @try {
+        id ident = [sRingingAlarm valueForKey:@"alarmID"];
+        if (ident) [m performSelector:sel withObject:ident];
+    } @catch (__unused NSException *e) {
+        @try { [m performSelector:sel withObject:SBYCallString(sRingingAlarm, @"alarmIDString")]; } @catch (__unused NSException *e2) {}
+    }
+}
+
++ (void)snoozeAlarm { SBYAlarmAction(@"snoozeAlarmWithIdentifier:"); [self clearAlarmRinging]; sLastAlarmCheck = 0; }
++ (void)stopAlarm { SBYAlarmAction(@"dismissAlarmWithIdentifier:"); [self clearAlarmRinging]; sLastAlarmCheck = 0; }
++ (void)clearAlarmRinging { sRingingSince = nil; sRingingAlarm = nil; }
 
 @end

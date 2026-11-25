@@ -64,14 +64,14 @@ enum { PVWidgets = 0, PVClock = 1 };
     next.theme = [SBYTheme current];
     next.frame = self.view.bounds;
     next.alpha = 0;
-    next.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(dx * 60, dy * 60), 0.96, 0.96);
+    next.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(dx * 60, dy * 110), 0.96, 0.96);
     [self.view addSubview:next];
     _current = next;
     [UIView animateWithDuration:0.5 delay:0 usingSpringWithDamping:0.88 initialSpringVelocity:0.4 options:UIViewAnimationOptionAllowUserInteraction animations:^{
         next.alpha = 1;
         next.transform = CGAffineTransformIdentity;
         old.alpha = 0;
-        old.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(-dx * 60, -dy * 60), 0.96, 0.96);
+        old.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(-dx * 60, -dy * 110), 0.96, 0.96);
     } completion:^(BOOL f) {
         [old removeFromSuperview];
         old.alpha = 1;

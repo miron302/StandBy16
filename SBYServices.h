@@ -10,6 +10,16 @@ extern NSString *const SBYServicesDidUpdate;
 + (NSString *)monthShort;        // "Oct"
 + (NSString *)dayNumber;         // "28"
 + (NSString *)alarmString;       // nil if no alarm in the next 24h
+
+// Alarm that is currently ringing (detected when the next alarm's time passes). Best effort; needs MobileTimer's
+// snooze/dismiss methods, otherwise the Alarm view stays off and iOS handles it as usual.
++ (void)updateAlarmState;       // call about once a second
++ (BOOL)alarmRinging;
++ (BOOL)alarmAPIAvailable;
++ (NSDictionary *)ringingAlarm;  // label, since
++ (void)snoozeAlarm;
++ (void)stopAlarm;
++ (void)clearAlarmRinging;
 + (NSDate *)nextAlarmDate;       // nil if no alarm in the next 24h
 
 // Clock-app timer (shown like a Live Activity). Returns NO when no timer is running.
@@ -31,4 +41,12 @@ extern NSString *const SBYServicesDidUpdate;
 + (NSString *)weatherCondition;  // "Light rain"
 + (NSString *)weatherHighLow;    // "H:14°  L:8°"
 + (void)refreshWeatherIfNeeded;
+
+// Calls (TelephonyUtilities, looked up at runtime; all of this is a no-op if the API differs on your iOS).
++ (BOOL)callAPIAvailable;
++ (void)setCallState:(NSString *)state;       // nil, @"incoming", @"dialing" or @"connected" (from CTCallCenter)
++ (NSString *)callState;
++ (NSDictionary *)callInfo;                   // state, name, number, since
++ (void)answerCall;
++ (void)endCall;
 @end

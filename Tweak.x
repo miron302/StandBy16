@@ -43,6 +43,10 @@ static void SBYForward(BBBulletin *b) {
     %orig;
     [[SBYController shared] setCoverSheetViewController:self];
 }
+// Ask iOS itself to hide the status bar while StandBy is up.
+- (BOOL)prefersStatusBarHidden {
+    return [[SBYController shared] standByActive] ? YES : %orig;
+}
 %end
 
 // Incoming notifications: StandBy shows them enlarged. The method name differs between iOS builds, so hook both.

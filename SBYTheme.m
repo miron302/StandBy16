@@ -40,6 +40,9 @@
             @"screenMethod": @0,
             @"stillnessMethod": @0,
             @"overlayMethod": @0,
+            @"callsView": @YES,
+            @"alarmView": @YES,
+            @"alwaysOn": @NO,
             @"orientationFlip": @0,
             @"hideSystemUI": @YES,
             @"showWhileScreenOff": @YES,
@@ -102,19 +105,29 @@ static BOOL sAmbientDark = NO;
     }
 }
 
++ (UIColor *)customColorForKey:(NSString *)key {
+    NSString *hex = [[SBYPrefs defaults] stringForKey:key];
+    if (hex.length != 6) return nil;
+    unsigned v = 0;
+    if (![[NSScanner scannerWithString:hex] scanHexInt:&v]) return nil;
+    return [UIColor colorWithRed:((v >> 16) & 0xFF) / 255.0 green:((v >> 8) & 0xFF) / 255.0 blue:(v & 0xFF) / 255.0 alpha:1];
+}
+
 + (instancetype)current {
     SBYTheme *t = [SBYTheme new];
     t.night = [self nightActive];
     if (t.night) {
-        // Night mode: everything collapses to one red hue, tint choice is ignored.
-        t.bright  = [UIColor colorWithRed:1.0 green:0 blue:0 alpha:1];
-        t.primary = [UIColor colorWithRed:0.8 green:0 blue:0 alpha:1];
-        t.dim     = [UIColor colorWithRed:0.6 green:0 blue:0 alpha:1];
-        t.faint   = [UIColor colorWithRed:0.3 green:0 blue:0 alpha:1];
-        t.accent  = [UIColor colorWithRed:0.91 green:0.18 blue:0.13 alpha:1];
+        // Night mode: everything collapses to one hue (red unless you picked another colour).
+        UIColor *base = [self customColorForKey:@"nightColorHex"] ?: [UIColor colorWithRed:1.0 green:0 blue:0 alpha:1];
+        t.bright  = base;
+        t.primary = SBYColorScaled(base, 0.8);
+        t.dim     = SBYColorScaled(base, 0.6);
+        t.faint   = SBYColorScaled(base, 0.3);
+        t.accent  = SBYColorScaled(base, 0.92);
         return t;
     }
-    UIColor *tint = [self tintColorForIndex:[SBYPrefs integerForKey:@"tintIndex"]];
+    UIColor *tint = [self customColorForKey:@"normalColorHex"] ?: [self tintColorForIndex:[SBYPrefs integerForKey:@"tintIndex"]];
+    t.tint = tint;
     if (tint) {
         t.bright = tint;
         t.primary = [tint colorWithAlphaComponent:0.85];
@@ -131,6 +144,12 @@ static BOOL sAmbientDark = NO;
     return t;
 }
 @end
+
+UIColor *SBYColorScaled(UIColor *c, CGFloat k) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    [c getRed:&r green:&g blue:&b alpha:&a];
+    return [UIColor colorWithRed:MIN(1, r * k) green:MIN(1, g * k) blue:MIN(1, b * k) alpha:a];
+}
 
 #pragma mark - Fonts
 

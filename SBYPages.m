@@ -4,7 +4,7 @@
 
 NSArray<Class> *SBYClockStyleClasses(void) {
     return @[ [SBYDigitalPageView class], [SBYAnalogPageView class], [SBYSolarPageView class],
-              [SBYFloatPageView class], [SBYWorldPageView class], [SBYBoldPageView class] ];
+              [SBYFloatPageView class], [SBYFloatColorPageView class], [SBYWorldPageView class], [SBYBoldPageView class] ];
 }
 
 static CGPoint SBYRayToRect(CGPoint c, CGFloat dx, CGFloat dy, CGRect R) {
@@ -28,11 +28,27 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
     CGContextFillEllipseInRect(c, CGRectMake(p.x - r, p.y - r, r * 2, r * 2));
 }
 
+static CGFloat SBYEaseOutBack(CGFloat x) {
+    x = MAX(0, MIN(1, x));
+    const CGFloat c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * pow(x - 1, 3) + c1 * pow(x - 1, 2);
+}
+
+static CGFloat SBYEaseInOutCubic(CGFloat x) {
+    x = MAX(0, MIN(1, x));
+    return x < 0.5 ? 4 * x * x * x : 1 - pow(-2 * x + 2, 3) / 2;
+}
+
+static BOOL sAnimationsSuspended;
+
 #pragma mark - Base
 
 @implementation SBYPageView {
-    NSString *_lastTime;
+    NSString *_lastTime, *_prevTime;
+    CFTimeInterval _appearT, _rollT0;
+    NSTimer *_liveTimer, *_rollTimer;
 }
++ (void)setAnimationsSuspended:(BOOL)suspended { sAnimationsSuspended = suspended; }
 @synthesize theme = _theme;
 
 - (instancetype)initWithFrame:(CGRect)f {
@@ -49,15 +65,80 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
 - (void)setTheme:(SBYTheme *)t { _theme = t; [self setNeedsDisplay]; }
 - (void)tick {
     NSString *ts = [SBYServices timeString];
-    BOOL changed = _lastTime && ![ts isEqualToString:_lastTime];
+    NSString *old = _lastTime;
+    BOOL changed = old && ![ts isEqualToString:old];
     _lastTime = ts;
-    if (changed && self.minuteTransition && self.window) {
-        // soft cross-dissolve when the time changes, like iOS does
-        [UIView transitionWithView:self duration:0.4 options:UIViewAnimationOptionTransitionCrossDissolve
-                        animations:^{ [self setNeedsDisplay]; } completion:nil];
-        return;
+    if (changed && self.window) {
+        if (_rollsDigits && ts.length == old.length) {
+            // changed digits roll up and fade, the new ones rise in from below
+            _prevTime = old;
+            _rollT0 = CACurrentMediaTime();
+            [_rollTimer invalidate];
+            _rollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60 target:self selector:@selector(rollStep) userInfo:nil repeats:YES];
+            [self setNeedsDisplay];
+            return;
+        }
+        if (_minuteTransition) {
+            // soft cross-dissolve when the time changes, like iOS does
+            [UIView transitionWithView:self duration:0.4 options:UIViewAnimationOptionTransitionCrossDissolve
+                            animations:^{ [self setNeedsDisplay]; } completion:nil];
+            return;
+        }
     }
     [self setNeedsDisplay];
+}
+
+- (void)rollStep {
+    [self setNeedsDisplay];
+    if (CACurrentMediaTime() - _rollT0 > 0.6) { [_rollTimer invalidate]; _rollTimer = nil; _prevTime = nil; }
+}
+
+// Pages that move continuously (floating digits, sweeping hands, progress) get a light redraw timer while visible.
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [_liveTimer invalidate];
+    _liveTimer = nil;
+    if (self.window) {
+        _appearT = CACurrentMediaTime();
+        if (_liveFPS > 0)
+            _liveTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / _liveFPS target:self selector:@selector(liveStep) userInfo:nil repeats:YES];
+    } else {
+        [_rollTimer invalidate];
+        _rollTimer = nil;
+        _prevTime = nil;
+    }
+}
+- (void)liveStep { if (!sAnimationsSuspended) [self setNeedsDisplay]; }
+- (CFTimeInterval)pageAge { return CACurrentMediaTime() - _appearT; }
+
+- (void)drawChar:(NSString *)ch index:(NSUInteger)i order:(NSInteger)order at:(CGPoint)pt font:(UIFont *)font color:(UIColor *)color {
+    CGContextRef c = UIGraphicsGetCurrentContext();
+    CGFloat cw = [ch sizeWithAttributes:@{ NSFontAttributeName: font }].width;
+    CGContextSaveGState(c);
+    if (order >= 0) { // entrance: each digit pops in with a little overshoot, one after another
+        CFTimeInterval a = self.pageAge - order * 0.07;
+        CGFloat s = 0.55 + 0.45 * SBYEaseOutBack(a / 0.6);
+        CGContextSetAlpha(c, MAX(0, MIN(1, a / 0.25)));
+        CGContextTranslateCTM(c, pt.x + cw / 2, pt.y);
+        CGContextScaleCTM(c, s, s);
+        CGContextTranslateCTM(c, -(pt.x + cw / 2), -pt.y);
+    }
+    NSString *old = (_prevTime && i < _prevTime.length) ? [_prevTime substringWithRange:NSMakeRange(i, 1)] : nil;
+    CGFloat prog = old ? SBYEaseInOutCubic((CACurrentMediaTime() - _rollT0) / 0.5) : 1;
+    if (!old || prog >= 1 || [old isEqualToString:ch]) {
+        SBYDrawTextAt(ch, font, color, pt, NSTextAlignmentLeft, 0);
+    } else {
+        CGFloat amp = font.pointSize * 0.30;
+        CGContextSaveGState(c);
+        CGContextSetAlpha(c, (1 - prog) * 1.0);
+        SBYDrawTextAt(old, font, color, CGPointMake(pt.x, pt.y - amp * prog), NSTextAlignmentLeft, 0);
+        CGContextRestoreGState(c);
+        CGContextSaveGState(c);
+        CGContextSetAlpha(c, prog);
+        SBYDrawTextAt(ch, font, color, CGPointMake(pt.x, pt.y + amp * (1 - prog)), NSTextAlignmentLeft, 0);
+        CGContextRestoreGState(c);
+    }
+    CGContextRestoreGState(c);
 }
 - (CGRect)safeRect { return CGRectInset(self.bounds, 46, 8); }
 - (void)drawRect:(CGRect)rect {
@@ -75,23 +156,42 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
 #pragma mark - Digital
 
 @implementation SBYDigitalPageView
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) { self.rollsDigits = YES; self.minuteTransition = NO; }
+    return self;
+}
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
     SBYTheme *t = self.theme;
-    UIColor *start = t.night ? [UIColor colorWithRed:0.22 green:0 blue:0 alpha:1] : [UIColor colorWithWhite:0.16 alpha:1];
+    UIColor *start = t.night ? SBYColorScaled(t.bright, 0.22) : [UIColor colorWithWhite:0.16 alpha:1];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     NSArray *cols = @[ (id)start.CGColor, (id)[UIColor blackColor].CGColor ];
     CGGradientRef g = CGGradientCreateWithColors(cs, (__bridge CFArrayRef)cols, NULL);
     CGContextDrawLinearGradient(c, g, CGPointZero, CGPointMake(b.size.width, 0), 0);
     CGGradientRelease(g);
     CGColorSpaceRelease(cs);
-    SBYDrawTextAt([SBYServices timeString], SBYExpandedFont(b.size.height * 0.5, UIFontWeightSemibold), t.primary,
-                  CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b)), NSTextAlignmentCenter, [self safeRect].size.width);
+    NSString *time = [SBYServices timeString];
+    CGFloat size = b.size.height * 0.5, maxW = [self safeRect].size.width;
+    UIFont *font = SBYExpandedFont(size, UIFontWeightSemibold);
+    CGFloat total = 0;
+    for (NSUInteger i = 0; i < time.length; i++)
+        total += [[time substringWithRange:NSMakeRange(i, 1)] sizeWithAttributes:@{ NSFontAttributeName: font }].width;
+    if (total > maxW) { size *= maxW / total; font = SBYExpandedFont(size, UIFontWeightSemibold); total = maxW; }
+    CGFloat x = CGRectGetMidX(b) - total / 2, y = CGRectGetMidY(b);
+    for (NSUInteger i = 0; i < time.length; i++) {
+        NSString *ch = [time substringWithRange:NSMakeRange(i, 1)];
+        [self drawChar:ch index:i order:-1 at:CGPointMake(x, y) font:font color:t.primary];
+        x += [ch sizeWithAttributes:@{ NSFontAttributeName: font }].width;
+    }
 }
 @end
 
 #pragma mark - Float
 
 @implementation SBYFloatPageView
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) { self.rollsDigits = YES; self.minuteTransition = NO; self.liveFPS = 24; }
+    return self;
+}
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
     SBYTheme *t = self.theme;
     CGFloat w = b.size.width, h = b.size.height;
@@ -126,7 +226,7 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
             x += size * 0.2;
         } else {
             CGFloat dw = [ch sizeWithAttributes:@{ NSFontAttributeName: f }].width;
-            SBYDrawTextAt(ch, f, col, CGPointMake(x, cy), NSTextAlignmentLeft, 0);
+            [self drawChar:ch index:i order:(NSInteger)i at:CGPointMake(x, cy) font:f color:col];
             x += dw * 0.78;
         }
     }
@@ -141,11 +241,154 @@ static void SBYDot(CGContextRef c, CGPoint p, CGFloat r, UIColor *col) {
 }
 @end
 
+#pragma mark - Float (colour): two-tone floating digits + battery ring + alarm
+
+static UIColor *SBYScaleColor(UIColor *c, CGFloat k) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    [c getRed:&r green:&g blue:&b alpha:&a];
+    return [UIColor colorWithRed:MIN(1, r * k) green:MIN(1, g * k) blue:MIN(1, b * k) alpha:a];
+}
+
+@implementation SBYFloatColorPageView {
+    CFTimeInterval _ringT0;
+    BOOL _lastCharging;
+}
+
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) { self.rollsDigits = YES; self.minuteTransition = NO; self.liveFPS = 24; }
+    return self;
+}
+
+// The base class runs a light 24fps timer while this page is on screen: digits drift, the battery ring draws in.
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window) {
+        _ringT0 = CACurrentMediaTime();
+        _lastCharging = [SBYServices isCharging];
+    }
+}
+
+- (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
+    SBYTheme *t = self.theme;
+    CGFloat w = b.size.width, h = b.size.height;
+    CFTimeInterval age = self.pageAge;
+
+    // palette: blue by default, the chosen colour if there is one, red at night
+    UIColor *dark, *light, *dot;
+    if (t.night) {
+        dark = SBYColorScaled(t.bright, 0.55);
+        light = [t.bright colorWithAlphaComponent:0.9];
+        dot = SBYColorScaled(t.bright, 0.8);
+    } else {
+        UIColor *tint = t.tint;
+        if (tint) { dark = SBYScaleColor(tint, 0.62); light = [tint colorWithAlphaComponent:0.92]; }
+        else { dark = [UIColor colorWithRed:0.16 green:0.37 blue:0.70 alpha:1]; light = [UIColor colorWithRed:0.40 green:0.63 blue:0.90 alpha:0.93]; }
+        dot = [UIColor colorWithWhite:0.76 alpha:1];
+    }
+
+    NSString *time = [SBYServices timeString];
+    CGFloat size = h * 0.96;
+    CGFloat step = 0.66;
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSUInteger i = 0; i < time.length; i++) [tokens addObject:[time substringWithRange:NSMakeRange(i, 1)]];
+
+    CGFloat (^measure)(CGFloat) = ^CGFloat(CGFloat sz) {
+        UIFont *f = SBYRoundedFont(sz, UIFontWeightHeavy);
+        CGFloat total = 0;
+        for (NSString *ch in tokens) {
+            if ([ch isEqualToString:@":"]) total += sz * 0.2;
+            else total += [ch sizeWithAttributes:@{ NSFontAttributeName: f }].width * step;
+        }
+        return total + sz * 0.1;
+    };
+    CGFloat total = measure(size), maxW = [self safeRect].size.width * 0.96;
+    if (total > maxW) { size *= maxW / total; total = measure(size); }
+    UIFont *font = SBYRoundedFont(size, UIFontWeightHeavy);
+
+    // layout pass
+    CGFloat x = w / 2 - total / 2;
+    CGFloat cy = h * 0.47;
+    NSMutableArray *digits = [NSMutableArray array];  // {char, x, digit number, index in the time string}
+    CGFloat colonX = 0;
+    int di = 0;
+    for (NSUInteger ti = 0; ti < tokens.count; ti++) {
+        NSString *ch = tokens[ti];
+        if ([ch isEqualToString:@":"]) { colonX = x + size * 0.1; x += size * 0.2; continue; }
+        [digits addObject:@[ ch, @(x), @(di++), @(ti) ]];
+        x += [ch sizeWithAttributes:@{ NSFontAttributeName: font }].width * step;
+    }
+    // dark digits first, then the light ones overlap them, like the real Float
+    for (int pass = 0; pass < 2; pass++) {
+        for (NSArray *d in digits) {
+            int idx = [d[2] intValue];
+            if ((idx % 2 == 0) != (pass == 0)) continue;
+            CGFloat dx = cos(age * 0.7 + idx * 0.9) * h * 0.006;
+            CGFloat dy = sin(age * 0.9 + idx * 1.3) * h * 0.012;   // gentle floating
+            [self drawChar:d[0] index:[d[3] unsignedIntegerValue] order:idx at:CGPointMake([d[1] floatValue] + dx, cy + dy) font:font color:(pass == 0 ? dark : light)];
+        }
+    }
+    if (colonX > 0) {
+        CGFloat r = size * 0.075;
+        CGFloat dy = sin(age * 0.9 + 2.1) * h * 0.01;
+        SBYDot(c, CGPointMake(colonX, cy - size * 0.17 + dy), r, dot);
+        SBYDot(c, CGPointMake(colonX, cy + size * 0.17 + dy), r, dot);
+    }
+
+    // Battery ring (top right): draws in clockwise, a bolt pops while charging, then it holds for 3 seconds after the
+    // animation finishes and fades away. Plugging in or unplugging replays it.
+    BOOL chargingNow = [SBYServices isCharging];
+    if (chargingNow != _lastCharging) { _lastCharging = chargingNow; _ringT0 = CACurrentMediaTime(); }
+    CFTimeInterval rage = CACurrentMediaTime() - _ringT0;
+    const CFTimeInterval kDelay = 0.35, kDrawTime = 1.0, kHold = 3.0, kFade = 0.5;
+    CGFloat ringAlpha = 1.0 - MAX(0, MIN(1, (rage - (kDelay + kDrawTime + kHold)) / kFade));
+    if (ringAlpha > 0.001) {
+        CGFloat rr = h * 0.075, rcx = w - MAX(46, w * 0.055) - rr, rcy = h * 0.115;
+        NSInteger pct = [SBYServices batteryPercent];
+        UIColor *green = t.night ? t.bright : [UIColor colorWithRed:0.39 green:0.82 blue:0.35 alpha:1];
+        CGFloat draw = MIN(1, SBYEaseOutBack(MAX(0, (rage - kDelay) / kDrawTime)));
+        CGFloat pf = pct < 0 ? 0 : pct / 100.0;
+        CGContextSaveGState(c);
+        CGContextSetAlpha(c, ringAlpha);
+        UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:CGPointMake(rcx, rcy) radius:rr startAngle:0 endAngle:2 * M_PI clockwise:YES];
+        track.lineWidth = rr * 0.2;
+        [[green colorWithAlphaComponent:0.22 * MIN(1, draw * 2)] setStroke];
+        [track stroke];
+        if (pf > 0 && draw > 0) {
+            UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:CGPointMake(rcx, rcy) radius:rr startAngle:-M_PI_2
+                                                             endAngle:-M_PI_2 + 2 * M_PI * pf * draw clockwise:YES];
+            arc.lineWidth = rr * 0.2;
+            arc.lineCapStyle = kCGLineCapRound;
+            [green setStroke];
+            [arc stroke];
+        }
+        if (chargingNow && rage < 2.8) {
+            CGFloat s = SBYEaseOutBack((rage - 0.9) / 0.5);
+            if (s > 0) SBYDrawSymbol(@"bolt.fill", green, CGRectMake(rcx - rr * 0.32 * s, rcy - rr * 0.45 * s, rr * 0.64 * s, rr * 0.9 * s));
+        } else if (pct >= 0) {
+            SBYDrawTextAt([NSString stringWithFormat:@"%ld", (long)pct], [UIFont systemFontOfSize:rr * 0.95 weight:UIFontWeightSemibold],
+                          green, CGPointMake(rcx, rcy), NSTextAlignmentCenter, rr * 1.5);
+        }
+        CGContextRestoreGState(c);
+    }
+
+    // alarm (bottom right)
+    NSString *alarm = [SBYServices alarmString];
+    if (alarm) {
+        CGFloat fs = h * 0.058;
+        CGFloat ax = w * 0.765, ay = h * 0.885;
+        UIColor *red = t.night ? t.bright : [UIColor colorWithRed:0.92 green:0.27 blue:0.20 alpha:1];
+        SBYDrawSymbol(@"alarm.fill", red, CGRectMake(ax, ay - fs * 0.55, fs * 1.1, fs * 1.1));
+        SBYDrawTextAt(alarm, [UIFont italicSystemFontOfSize:fs], t.night ? t.primary : [UIColor whiteColor],
+                      CGPointMake(ax + fs * 1.4, ay + fs * 0.1), NSTextAlignmentLeft, 0);
+    }
+}
+@end
+
 #pragma mark - Analog
 
 @implementation SBYAnalogPageView
 - (instancetype)initWithFrame:(CGRect)f {
-    if ((self = [super initWithFrame:f])) self.minuteTransition = NO;
+    if ((self = [super initWithFrame:f])) { self.minuteTransition = NO; self.liveFPS = 30; }  // smooth sweeping second hand
     return self;
 }
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
@@ -520,6 +763,7 @@ static const SBYWidgetFn kWidgetFns[SBY_WIDGET_N] = { SBYWidgetClock, SBYWidgetA
         _idx[1] = MAX(0, MIN((NSInteger)_orderR.count - 1, [SBYPrefs integerForKey:@"rightStack"]));
         _editing = -1;
         self.minuteTransition = NO;
+        self.liveFPS = 12; // smooth ring sweep in the clock widget
         _lastTouch = CACurrentMediaTime();
     }
     return self;
@@ -687,6 +931,7 @@ static NSString *SBYClockText(double sec) {
 - (instancetype)initWithFrame:(CGRect)f {
     if ((self = [super initWithFrame:f])) {
         self.minuteTransition = NO;
+        self.liveFPS = 20; // smooth progress bar
         _artScale = 1;
         _pressed = -1;
     }
@@ -828,11 +1073,160 @@ static NSString *SBYClockText(double sec) {
 }
 @end
 
+#pragma mark - Alarm (full-screen takeover while an alarm is ringing)
+
+@implementation SBYAlarmPageView {
+    CGRect _btn[2]; // 0 = Snooze, 1 = Stop
+}
+
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) { self.minuteTransition = NO; self.liveFPS = 30; }
+    return self;
+}
+
+- (BOOL)handleTapAt:(CGPoint)p {
+    if (CGRectContainsPoint(CGRectInset(_btn[0], -12, -12), p)) { [SBYServices snoozeAlarm]; return YES; }
+    if (CGRectContainsPoint(CGRectInset(_btn[1], -12, -12), p)) { [SBYServices stopAlarm]; return YES; }
+    return NO;
+}
+
+- (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
+    SBYTheme *t = self.theme;
+    NSDictionary *info = [SBYServices ringingAlarm];
+    if (!info) return;
+    CGFloat w = b.size.width, h = b.size.height;
+    CFTimeInterval age = self.pageAge;
+    UIColor *orange = t.night ? t.bright : [UIColor colorWithRed:1.0 green:0.62 blue:0.04 alpha:1];
+
+    // alarm icon that rings: short wobbling bursts, then a pause
+    CGFloat is = h * 0.11, left = MAX(46, w * 0.06);
+    CGPoint ic = CGPointMake(left + is / 2, h * 0.17);
+    CGFloat burst = fmod(age, 1.4);
+    CGFloat angle = burst < 0.7 ? sin(burst * 38) * 0.28 * (1 - burst / 0.7) : 0;
+    CGContextSaveGState(c);
+    CGContextTranslateCTM(c, ic.x, ic.y);
+    CGContextRotateCTM(c, angle);
+    SBYDrawSymbol(@"alarm.fill", orange, CGRectMake(-is / 2, -is / 2, is, is));
+    CGContextRestoreGState(c);
+    SBYDrawTextAt(info[@"label"], [UIFont systemFontOfSize:h * 0.075 weight:UIFontWeightSemibold], orange,
+                  CGPointMake(left + is + w * 0.02, h * 0.17), NSTextAlignmentLeft, w * 0.6);
+
+    // big time, softly pulsing
+    CGFloat pulse = 0.88 + 0.12 * (0.5 + 0.5 * sin(age * 2.6));
+    CGContextSaveGState(c);
+    CGContextSetAlpha(c, pulse);
+    SBYDrawTextAt([SBYServices timeString], SBYExpandedFont(h * 0.42, UIFontWeightSemibold), t.bright,
+                  CGPointMake(w / 2, h * 0.5), NSTextAlignmentCenter, [self safeRect].size.width);
+    CGContextRestoreGState(c);
+
+    // Snooze (orange) and Stop (grey), like the iOS alarm
+    CGFloat bw = w * 0.27, bh = h * 0.17, gap = w * 0.04, by = h * 0.84;
+    CGRect snooze = CGRectMake(w / 2 - gap / 2 - bw, by - bh / 2, bw, bh);
+    CGRect stop = CGRectMake(w / 2 + gap / 2, by - bh / 2, bw, bh);
+    _btn[0] = snooze; _btn[1] = stop;
+    UIFont *bf = [UIFont systemFontOfSize:bh * 0.42 weight:UIFontWeightSemibold];
+    [orange setFill];
+    [[UIBezierPath bezierPathWithRoundedRect:snooze cornerRadius:bh / 2] fill];
+    SBYDrawTextAt(@"Snooze", bf, [UIColor blackColor], CGPointMake(CGRectGetMidX(snooze), CGRectGetMidY(snooze)), NSTextAlignmentCenter, 0);
+    [(t.night ? t.faint : [UIColor colorWithWhite:0.22 alpha:1]) setFill];
+    [[UIBezierPath bezierPathWithRoundedRect:stop cornerRadius:bh / 2] fill];
+    SBYDrawTextAt(@"Stop", bf, t.bright, CGPointMake(CGRectGetMidX(stop), CGRectGetMidY(stop)), NSTextAlignmentCenter, 0);
+}
+@end
+
+#pragma mark - Call (full-screen takeover while a call is ringing / active)
+
+@implementation SBYCallPageView {
+    CGRect _btn[2];
+    int _kind[2];   // 0 = decline / end, 1 = accept
+    int _count;
+}
+
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) { self.minuteTransition = NO; self.liveFPS = 20; }
+    return self;
+}
+
+- (BOOL)handleTapAt:(CGPoint)p {
+    for (int i = 0; i < _count; i++) {
+        if (!CGRectContainsPoint(CGRectInset(_btn[i], -14, -14), p)) continue;
+        if (_kind[i] == 1) [SBYServices answerCall]; else [SBYServices endCall];
+        return YES;
+    }
+    return NO;
+}
+
+- (void)drawContent:(CGContextRef)c bounds:(CGRect)b {
+    SBYTheme *t = self.theme;
+    NSDictionary *info = [SBYServices callInfo];
+    if (!info) return;
+    CGFloat w = b.size.width, h = b.size.height;
+    NSString *state = info[@"state"];
+    NSString *name = info[@"name"] ?: @"Unknown";
+    BOOL incoming = [state isEqualToString:@"incoming"];
+
+    // avatar
+    CGFloat d = h * 0.5, left = MAX(46, w * 0.06);
+    CGPoint ac = CGPointMake(left + d / 2, h * 0.5);
+    [[t.faint colorWithAlphaComponent:0.6] setFill];
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(ac.x - d / 2, ac.y - d / 2, d, d)] fill];
+    NSMutableString *initials = [NSMutableString string];
+    for (NSString *wd in [name componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]) {
+        if (wd.length && [[NSCharacterSet letterCharacterSet] characterIsMember:[wd characterAtIndex:0]] && initials.length < 2)
+            [initials appendString:[[wd substringToIndex:1] uppercaseString]];
+    }
+    if (initials.length) SBYDrawTextAt(initials, SBYRoundedFont(d * 0.38, UIFontWeightSemibold), t.bright, ac, NSTextAlignmentCenter, 0);
+    else SBYDrawSymbol(@"person.fill", t.primary, CGRectMake(ac.x - d * 0.28, ac.y - d * 0.28, d * 0.56, d * 0.56));
+
+    // name + status
+    CGFloat x0 = left + d + w * 0.05, tw = w - x0 - 46;
+    SBYDrawTextAt(name, [UIFont systemFontOfSize:h * 0.1 weight:UIFontWeightBold], t.bright, CGPointMake(x0, h * 0.3), NSTextAlignmentLeft, tw);
+    NSString *line;
+    if ([state isEqualToString:@"connected"]) {
+        NSDate *since = info[@"since"];
+        long sec = since ? lround([[NSDate date] timeIntervalSinceDate:since]) : 0;
+        line = sec >= 3600 ? [NSString stringWithFormat:@"%ld:%02ld:%02ld", sec / 3600, (sec % 3600) / 60, sec % 60]
+                           : [NSString stringWithFormat:@"%ld:%02ld", sec / 60, sec % 60];
+    } else line = incoming ? @"Incoming call…" : @"Calling…";
+    SBYDrawTextAt(line, [UIFont monospacedDigitSystemFontOfSize:h * 0.07 weight:UIFontWeightMedium], t.primary, CGPointMake(x0, h * 0.43), NSTextAlignmentLeft, tw);
+    NSString *number = info[@"number"];
+    if (number.length && ![number isEqualToString:name])
+        SBYDrawTextAt(number, [UIFont systemFontOfSize:h * 0.052 weight:UIFontWeightRegular], t.dim, CGPointMake(x0, h * 0.53), NSTextAlignmentLeft, tw);
+
+    // buttons
+    CGFloat bd = h * 0.2, by = h * 0.78;
+    UIColor *red = t.night ? SBYColorScaled(t.bright, 0.7) : [UIColor colorWithRed:1.0 green:0.23 blue:0.19 alpha:1];
+    UIColor *green = t.night ? t.bright : [UIColor colorWithRed:0.2 green:0.78 blue:0.35 alpha:1];
+    UIFont *lf = [UIFont systemFontOfSize:h * 0.048 weight:UIFontWeightMedium];
+    _count = incoming ? 2 : 1;
+    for (int i = 0; i < _count; i++) {
+        BOOL accept = incoming && i == 1;
+        CGFloat bx = x0 + bd / 2 + i * (bd + w * 0.06);
+        _kind[i] = accept ? 1 : 0;
+        _btn[i] = CGRectMake(bx - bd / 2, by - bd / 2, bd, bd);
+        UIColor *col = accept ? green : red;
+        if (accept) { // gentle pulse so the accept button draws the eye
+            CGFloat ph = fmod(self.pageAge * 0.9, 1.0);
+            CGFloat rr = bd / 2 + ph * bd * 0.35;
+            [[col colorWithAlphaComponent:0.35 * (1 - ph)] setStroke];
+            UIBezierPath *ring = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(bx - rr, by - rr, rr * 2, rr * 2)];
+            ring.lineWidth = 3;
+            [ring stroke];
+        }
+        [col setFill];
+        [[UIBezierPath bezierPathWithOvalInRect:_btn[i]] fill];
+        SBYDrawSymbol(accept ? @"phone.fill" : @"phone.down.fill", t.night ? [UIColor blackColor] : [UIColor whiteColor],
+                      CGRectMake(bx - bd * 0.22, by - bd * 0.22, bd * 0.44, bd * 0.44));
+        SBYDrawTextAt(accept ? @"Accept" : (incoming ? @"Decline" : @"End"), lf, t.primary, CGPointMake(bx, by + bd / 2 + h * 0.06), NSTextAlignmentCenter, 0);
+    }
+}
+@end
+
 #pragma mark - Timer (Live Activity style takeover)
 
 @implementation SBYTimerPageView
 - (instancetype)initWithFrame:(CGRect)f {
-    if ((self = [super initWithFrame:f])) self.minuteTransition = NO;
+    if ((self = [super initWithFrame:f])) { self.minuteTransition = NO; self.liveFPS = 15; }
     return self;
 }
 - (void)drawContent:(CGContextRef)c bounds:(CGRect)b {

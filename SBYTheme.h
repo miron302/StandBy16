@@ -25,12 +25,15 @@
 @interface SBYTheme : NSObject
 @property (nonatomic, strong) UIColor *bright, *primary, *dim, *faint, *accent;
 @property (nonatomic) BOOL night;
+@property (nonatomic, strong) UIColor *tint; // normal-mode colour (custom or long-press choice); nil = default look
 + (instancetype)current;
 + (void)setAmbientDark:(BOOL)dark;
 + (NSInteger)tintCount;
 + (UIColor *)tintColorForIndex:(NSInteger)i; // nil for 0 = each style's default colours
++ (UIColor *)customColorForKey:(NSString *)key; // "RRGGBB" hex stored by the Colors settings page
 @end
 
+UIColor *SBYColorScaled(UIColor *c, CGFloat k); // multiply brightness (k<1 darker)
 UIFont *SBYExpandedFont(CGFloat size, UIFontWeight weight);
 UIFont *SBYRoundedFont(CGFloat size, UIFontWeight weight);
 UIFont *SBYCondensedFont(CGFloat size);

@@ -11,7 +11,7 @@ ARCHS = arm64 arm64e
 include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = StandBy16Prefs
-StandBy16Prefs_FILES = SBYTriggerController.m
+StandBy16Prefs_FILES = SBYPrefControllers.m
 StandBy16Prefs_INSTALL_PATH = /Library/PreferenceBundles
 StandBy16Prefs_FRAMEWORKS = UIKit
 StandBy16Prefs_CFLAGS = -fobjc-arc
